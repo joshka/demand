@@ -1,11 +1,12 @@
 use std::io;
-use std::io::Write;
 
 use console::{Key, Term};
-use termcolor::{Buffer, WriteColor};
 
+use crate::host::Host;
+use crate::prompt::{CliOptions, Outcome, Prompt};
+use crate::theme;
 use crate::theme::Theme;
-use crate::{ctrlc, theme};
+use crate::view::{Size, View};
 
 /// A confirmation dialog
 ///
@@ -42,9 +43,7 @@ pub struct Confirm<'a> {
     /// If true, the affirmative option is selected by default
     pub selected: bool,
 
-    term: Term,
     clear_screen: bool,
-    frame: crate::frame::Frame,
 }
 
 impl<'a> Confirm<'a> {
@@ -54,12 +53,10 @@ impl<'a> Confirm<'a> {
             title: title.into(),
             description: String::new(),
             theme: &*theme::DEFAULT,
-            term: Term::stderr(),
             affirmative: "Yes".to_string(),
             negative: "No".to_string(),
             selected: true,
             clear_screen: false,
-            frame: Default::default(),
         }
     }
 
@@ -192,52 +189,7 @@ impl<'a> Confirm<'a> {
             }
         }
 
-        let ctrlc_handle = ctrlc::show_cursor_after_ctrlc(&self.term)?;
-
-        let (_, _, affirmative_char, negative_char, has_conflict) = self.calculate_hints();
-        self.term.clear_line()?;
-        self.term.hide_cursor()?;
-        loop {
-            let term = self.term.clone();
-            crate::synchronized_output::run(&term, || self.draw())?;
-            match self.term.read_key()? {
-                Key::ArrowLeft | Key::Char('h') => self.handle_left(),
-                Key::ArrowRight | Key::Char('l') => self.handle_right(),
-                Key::Char(c) if !has_conflict && c == affirmative_char => {
-                    self.selected = true;
-                    ctrlc_handle.close();
-                    return self.handle_submit();
-                }
-                Key::Char(c) if !has_conflict && c == negative_char => {
-                    self.selected = false;
-                    ctrlc_handle.close();
-                    return self.handle_submit();
-                }
-                Key::Enter => {
-                    ctrlc_handle.close();
-                    return self.handle_submit();
-                }
-                Key::Escape => {
-                    self.clear()?;
-                    self.term.show_cursor()?;
-                    ctrlc_handle.close();
-                    return Err(io::Error::new(io::ErrorKind::Interrupted, "user cancelled"));
-                }
-                _ => {}
-            }
-        }
-    }
-
-    fn handle_submit(mut self) -> io::Result<bool> {
-        let term = self.term.clone();
-        crate::synchronized_output::run(&term, || {
-            self.term.clear_to_end_of_screen()?;
-            self.clear()?;
-            self.term.show_cursor()?;
-            let output = self.render_success()?;
-            self.term.write_all(output.as_bytes())
-        })?;
-        Ok(self.selected)
+        Host::new(Term::stderr()).run(&mut self, |confirm| Some(confirm.selected))
     }
 
     fn handle_left(&mut self) {
@@ -252,35 +204,35 @@ impl<'a> Confirm<'a> {
         }
     }
 
-    fn render(&self) -> io::Result<String> {
-        let mut out = Buffer::ansi();
+    fn render(&self) -> View {
+        let mut out = View::default();
 
-        out.set_color(&self.theme.title)?;
-        writeln!(out, "{}", self.title)?;
+        out.set_color(&self.theme.title);
+        writeln!(out, "{}", self.title);
 
         if !self.description.is_empty() {
-            out.set_color(&self.theme.description)?;
-            write!(out, "{}", self.description)?;
+            out.set_color(&self.theme.description);
+            write!(out, "{}", self.description);
         }
-        writeln!(out, "\n")?;
+        writeln!(out, "\n");
 
-        write!(out, " ")?;
+        write!(out, " ");
         if self.selected {
-            out.set_color(&self.theme.focused_button)?;
+            out.set_color(&self.theme.focused_button);
         } else {
-            out.set_color(&self.theme.blurred_button)?;
+            out.set_color(&self.theme.blurred_button);
         }
-        write!(out, "  {}  ", self.affirmative)?;
-        out.reset()?;
-        write!(out, " ")?;
+        write!(out, "  {}  ", self.affirmative);
+        out.reset();
+        write!(out, " ");
         if self.selected {
-            out.set_color(&self.theme.blurred_button)?;
+            out.set_color(&self.theme.blurred_button);
         } else {
-            out.set_color(&self.theme.focused_button)?;
+            out.set_color(&self.theme.focused_button);
         }
-        write!(out, "  {}  ", self.negative)?;
-        out.reset()?;
-        writeln!(out, "\n")?;
+        write!(out, "  {}  ", self.negative);
+        out.reset();
+        writeln!(out, "\n");
 
         let mut help_keys = vec![("←/→", "toggle")];
         let (affirmative_hint, negative_hint, _, _, has_conflict) = self.calculate_hints();
@@ -290,53 +242,63 @@ impl<'a> Confirm<'a> {
             format!("{}/{}/enter", affirmative_hint, negative_hint)
         };
         help_keys.push((&submit_keys, "submit"));
-        for (i, (key, desc)) in help_keys.iter().enumerate() {
-            if i > 0 {
-                out.set_color(&self.theme.help_sep)?;
-                write!(out, " • ")?;
-            }
-            out.set_color(&self.theme.help_key)?;
-            write!(out, "{key}")?;
-            out.set_color(&self.theme.help_desc)?;
-            write!(out, " {desc}")?;
-        }
-        writeln!(out)?;
+        out.write_help(self.theme, &help_keys, false);
+        writeln!(out);
 
-        out.reset()?;
-        Ok(std::str::from_utf8(out.as_slice()).unwrap().to_string())
+        out.reset();
+        out
     }
 
-    fn render_success(&self) -> io::Result<String> {
-        let mut out = Buffer::ansi();
-        out.set_color(&self.theme.title)?;
-        write!(out, "{}", self.title)?;
-        out.set_color(&self.theme.selected_option)?;
+    fn render_success(&self) -> View {
+        let mut out = View::default();
+        out.set_color(&self.theme.title);
+        write!(out, "{}", self.title);
+        out.set_color(&self.theme.selected_option);
         if self.selected {
-            writeln!(out, " {}", self.affirmative)?;
+            writeln!(out, " {}", self.affirmative);
         } else {
-            writeln!(out, " {}", self.negative)?;
+            writeln!(out, " {}", self.negative);
         }
-        out.reset()?;
-        Ok(std::str::from_utf8(out.as_slice()).unwrap().to_string())
+        out.reset();
+        out
+    }
+}
+
+impl Prompt for Confirm<'_> {
+    fn on_key(&mut self, key: Key) -> Outcome {
+        let (_, _, affirmative_char, negative_char, has_conflict) = self.calculate_hints();
+        match key {
+            Key::ArrowLeft | Key::Char('h') => self.handle_left(),
+            Key::ArrowRight | Key::Char('l') => self.handle_right(),
+            Key::Char(c) if !has_conflict && c == affirmative_char => {
+                self.selected = true;
+                return Outcome::Submit;
+            }
+            Key::Char(c) if !has_conflict && c == negative_char => {
+                self.selected = false;
+                return Outcome::Submit;
+            }
+            Key::Enter => return Outcome::Submit,
+            Key::Escape => return Outcome::Cancel,
+            _ => return Outcome::Ignored,
+        }
+        Outcome::Handled
     }
 
-    /// Render a frame and draw it over the previous one. With
-    /// `clear_screen` the screen is wiped first, so there is nothing left
-    /// to draw over and the frame goes out whole.
-    fn draw(&mut self) -> io::Result<()> {
-        if self.clear_screen {
-            self.clear()?;
-        }
-        let output = self.render()?;
-        self.frame.update(&self.term, output)
+    fn view(&mut self, _size: Size) -> View {
+        self.render()
     }
 
-    fn clear(&mut self) -> io::Result<()> {
-        self.frame.clear(&self.term)?;
-        if self.clear_screen {
-            self.term.clear_screen()?;
+    fn success(&mut self) -> View {
+        self.render_success()
+    }
+
+    fn cli(&self) -> CliOptions {
+        CliOptions {
+            clear_line: true,
+            clear_screen: self.clear_screen,
+            ..Default::default()
         }
-        Ok(())
     }
 }
 
@@ -355,7 +317,7 @@ mod tests {
             .affirmative("Yes!")
             .negative("No.");
 
-        let rendered = confirm.render().unwrap();
+        let rendered = confirm.render().to_ansi();
         let actual = without_ansi(rendered.as_str());
         assert_snapshot!(actual.as_ref(), @r"
         Are you sure?
@@ -373,7 +335,7 @@ mod tests {
             .affirmative("Confirm")
             .negative("Cancel");
 
-        let rendered = confirm.render().unwrap();
+        let rendered = confirm.render().to_ansi();
         let actual = without_ansi(rendered.as_str());
         assert_snapshot!(actual.as_ref(), @r"
         Deploy to production?
@@ -391,7 +353,7 @@ mod tests {
             .affirmative("Proceed")
             .negative("Abort");
 
-        let rendered = confirm.render().unwrap();
+        let rendered = confirm.render().to_ansi();
         let actual = without_ansi(rendered.as_str());
         assert_snapshot!(actual.as_ref(), @r"
         Delete file?
@@ -449,15 +411,15 @@ mod tests {
     fn a_wrapped_description_does_not_stack_copies_of_the_frame() {
         let (term, buf) = capture_term();
         let mut prompt = Confirm::new("Proceed?").description(&"d".repeat(200));
-        prompt.term = term;
-        let width = prompt.term.size().1 as usize;
+        let mut host = Host::new(term);
+        let width = host.term.size().1 as usize;
         assert!(
             width < 200,
             "test needs a description wider than the terminal"
         );
 
         for _ in 0..3 {
-            prompt.draw().unwrap();
+            host.draw(&mut prompt).unwrap();
             prompt.handle_right();
         }
 
