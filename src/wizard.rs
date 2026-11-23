@@ -1,10 +1,10 @@
 use std::io;
-use std::io::Write;
 
+use crate::prompt::Outcome;
 use crate::theme::Theme;
+use crate::view::View;
 use crate::{ctrlc, theme};
 use console::{Key, Term};
-use termcolor::{Buffer, WriteColor};
 
 /// Navigation result from a wizard section
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,30 +81,17 @@ impl<'a, S> Section<'a, S> {
 ///     .run(&mut State::default())?;
 /// ```
 pub struct Wizard<'a, S> {
-    /// The title displayed above the breadcrumb
-    title: String,
-    /// The sections in the wizard
+    steps: Steps<'a>,
+    /// The sections in the wizard, one for each step
     sections: Vec<Section<'a, S>>,
-    /// The current section index
-    current: usize,
-    /// The theme for styling
-    theme: &'a Theme,
-    /// Track which sections have been visited
-    visited: Vec<bool>,
-    /// Terminal handle
-    term: Term,
 }
 
 impl<'a, S> Wizard<'a, S> {
     /// Create a new wizard with the given title
     pub fn new<T: Into<String>>(title: T) -> Self {
         Self {
-            title: title.into(),
+            steps: Steps::new(title),
             sections: Vec::new(),
-            current: 0,
-            theme: &theme::DEFAULT,
-            visited: Vec::new(),
-            term: Term::stderr(),
         }
     }
 
@@ -114,14 +101,15 @@ impl<'a, S> Wizard<'a, S> {
         L: Into<String>,
         F: Fn(&mut S, &Theme) -> io::Result<Navigation> + 'a,
     {
-        self.sections.push(Section::new(label, run));
-        self.visited.push(false);
+        let section = Section::new(label, run);
+        self.steps = self.steps.step(section.label.clone());
+        self.sections.push(section);
         self
     }
 
     /// Set the theme for the wizard
     pub fn theme(mut self, theme: &'a Theme) -> Self {
-        self.theme = theme;
+        self.steps.theme = theme;
         self
     }
 
@@ -134,67 +122,25 @@ impl<'a, S> Wizard<'a, S> {
             return Ok(());
         }
 
-        let ctrlc_handle = ctrlc::show_cursor_after_ctrlc(&self.term)?;
+        let term = Term::stderr();
+        let ctrlc_handle = ctrlc::show_cursor_after_ctrlc(&term)?;
 
-        // Mark first section as visited
-        self.visited[0] = true;
-
-        loop {
-            // Run the current section
-            let section = &self.sections[self.current];
-            let result = (section.run)(state, self.theme);
-
-            match result {
-                Ok(Navigation::Next) => {
-                    if self.current + 1 < self.sections.len() {
-                        self.current += 1;
-                        self.visited[self.current] = true;
+        let result = loop {
+            let section = &self.sections[self.steps.current()];
+            match (section.run)(state, self.steps.theme) {
+                Ok(navigation) => {
+                    if self.steps.navigate(navigation) == Outcome::Submit {
+                        break Ok(());
                     }
                 }
-                Ok(Navigation::Back) => {
-                    if self.current > 0 {
-                        self.current -= 1;
-                        // Mark as visited in case we jumped over this section
-                        self.visited[self.current] = true;
-                    }
-                }
-                Ok(Navigation::Jump(idx)) => {
-                    if idx < self.sections.len() {
-                        self.current = idx;
-                        self.visited[self.current] = true;
-                    }
-                }
-                Ok(Navigation::Hub) => {
-                    // Return to section 0 (the hub)
-                    self.current = 0;
-                }
-                Ok(Navigation::Stay) => {
-                    // Stay on current section, just re-render
-                }
-                Ok(Navigation::Done) => {
-                    self.term.show_cursor()?;
-                    ctrlc_handle.close();
-                    return Ok(());
-                }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {
-                    // Escape pressed - go back if possible, otherwise cancel
-                    if self.current > 0 {
-                        self.current -= 1;
-                        // Mark as visited in case we jumped over this section
-                        self.visited[self.current] = true;
-                    } else {
-                        self.term.show_cursor()?;
-                        ctrlc_handle.close();
-                        return Err(e);
-                    }
-                }
-                Err(e) => {
-                    self.term.show_cursor()?;
-                    ctrlc_handle.close();
-                    return Err(e);
-                }
+                // Escape pressed - go back if possible, otherwise cancel
+                Err(e) if e.kind() == io::ErrorKind::Interrupted && self.steps.back() => {}
+                Err(e) => break Err(e),
             }
-        }
+        };
+        term.show_cursor()?;
+        ctrlc_handle.close();
+        result
     }
 
     /// Render the breadcrumb navigation bar as a string.
@@ -205,44 +151,135 @@ impl<'a, S> Wizard<'a, S> {
     ///
     /// Returns the rendered breadcrumb as a string that can be printed.
     pub fn render_breadcrumb(&self) -> io::Result<String> {
-        let mut out = Buffer::ansi();
+        let width = Term::stderr().size().1 as usize;
+        Ok(self.steps.view(width).to_ansi())
+    }
+}
+
+/// The steps of a multi-step flow, where the user is in them, and a
+/// breadcrumb showing it.
+///
+/// [`Wizard`] runs one prompt after another on the command line. In a
+/// larger interface, where prompts are shown by the interface instead, this
+/// keeps track of which one it's the turn of.
+///
+/// # Example
+/// ```rust
+/// use demand::{Navigation, Outcome, Steps};
+///
+/// let mut steps = Steps::new("Setup").step("Name").step("Tools");
+/// assert_eq!(steps.navigate(Navigation::Next), Outcome::Handled);
+/// assert_eq!(steps.current(), 1);
+/// assert!(steps.back());
+/// // There's nothing before the first step.
+/// assert!(!steps.back());
+/// ```
+pub struct Steps<'a> {
+    /// The title displayed above the breadcrumb
+    pub title: String,
+    /// The colors/style of the breadcrumb
+    pub theme: &'a Theme,
+    labels: Vec<String>,
+    current: usize,
+    /// Which steps have been visited
+    visited: Vec<bool>,
+}
+
+impl<'a> Steps<'a> {
+    /// Create steps with the given title
+    pub fn new<T: Into<String>>(title: T) -> Self {
+        Self {
+            title: title.into(),
+            theme: &theme::DEFAULT,
+            labels: Vec::new(),
+            current: 0,
+            visited: Vec::new(),
+        }
+    }
+
+    /// Add a step
+    pub fn step(mut self, label: impl Into<String>) -> Self {
+        self.labels.push(label.into());
+        self.visited.push(self.visited.is_empty());
+        self
+    }
+
+    /// Set the theme of the breadcrumb
+    pub fn theme(mut self, theme: &'a Theme) -> Self {
+        self.theme = theme;
+        self
+    }
+
+    /// The index of the current step
+    pub fn current(&self) -> usize {
+        self.current
+    }
+
+    /// Move to another step. [`Outcome::Submit`] means the steps are done.
+    pub fn navigate(&mut self, navigation: Navigation) -> Outcome {
+        match navigation {
+            Navigation::Next => self.go_to(self.current + 1),
+            Navigation::Back => {
+                self.back();
+            }
+            Navigation::Jump(step) => self.go_to(step),
+            Navigation::Hub => self.current = 0,
+            Navigation::Stay => {}
+            Navigation::Done => return Outcome::Submit,
+        }
+        Outcome::Handled
+    }
+
+    /// Move to the previous step, if there is one.
+    pub fn back(&mut self) -> bool {
+        if self.current == 0 {
+            return false;
+        }
+        // Marks it as visited too, in case it was jumped over.
+        self.go_to(self.current - 1);
+        true
+    }
+
+    fn go_to(&mut self, step: usize) {
+        if step < self.labels.len() {
+            self.current = step;
+            self.visited[step] = true;
+        }
+    }
+
+    pub(crate) fn view(&self, width: usize) -> View {
+        let mut out = View::default();
 
         // Title
-        out.set_color(&self.theme.title)?;
-        writeln!(out, "{}", self.title)?;
+        out.set_color(&self.theme.title);
+        writeln!(out, "{}", self.title);
 
         // Breadcrumb: [1:Section] > 2:Section > 3:Section
-        for (i, section) in self.sections.iter().enumerate() {
+        for (i, label) in self.labels.iter().enumerate() {
             if i > 0 {
-                out.set_color(&self.theme.description)?;
-                write!(out, "{}", self.theme.breadcrumb_separator)?;
+                out.set_color(&self.theme.description);
+                write!(out, "{}", self.theme.breadcrumb_separator);
             }
-
-            let is_current = i == self.current;
-            let is_visited = self.visited[i];
-
-            if is_current {
-                out.set_color(&self.theme.breadcrumb_active)?;
-                write!(out, "[{}:{}]", i + 1, section.label)?;
-            } else if is_visited {
-                out.set_color(&self.theme.breadcrumb_clickable)?;
-                write!(out, "{}:{}", i + 1, section.label)?;
+            if i == self.current {
+                out.set_color(&self.theme.breadcrumb_active);
+                write!(out, "[{}:{label}]", i + 1);
+            } else if self.visited[i] {
+                out.set_color(&self.theme.breadcrumb_clickable);
+                write!(out, "{}:{label}", i + 1);
             } else {
-                out.set_color(&self.theme.breadcrumb_future)?;
-                write!(out, "{}:{}", i + 1, section.label)?;
+                out.set_color(&self.theme.breadcrumb_future);
+                write!(out, "{}:{label}", i + 1);
             }
         }
-        writeln!(out)?;
+        writeln!(out);
 
         // Separator line
-        out.set_color(&self.theme.description)?;
-        let width = self.term.size().1 as usize;
-        let line_width = width.min(50);
-        writeln!(out, "{}", "─".repeat(line_width))?;
-        writeln!(out)?;
+        out.set_color(&self.theme.description);
+        writeln!(out, "{}", "─".repeat(width.min(50)));
+        writeln!(out);
 
-        out.reset()?;
-        Ok(std::str::from_utf8(out.as_slice()).unwrap().to_string())
+        out.reset();
+        out
     }
 }
 
