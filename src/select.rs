@@ -482,16 +482,17 @@ impl<'a, T> Select<'a, T> {
             out.reset()?;
 
             let cursor_idx = self.get_char_idx(&self.filter, self.cursor_x);
+            let after_cursor = self.get_char_idx(&self.filter, self.cursor_x + 1);
             write!(out, "{}", &self.filter[..cursor_idx])?;
 
             if cursor_idx < self.filter.len() {
                 out.set_color(&self.theme.real_cursor_color(None))?;
-                write!(out, "{}", &self.filter[cursor_idx..cursor_idx + 1])?;
+                write!(out, "{}", &self.filter[cursor_idx..after_cursor])?;
                 out.reset()?;
             }
-            if cursor_idx + 1 < self.filter.len() {
+            if after_cursor < self.filter.len() {
                 out.reset()?;
-                write!(out, "{}", &self.filter[cursor_idx + 1..])?;
+                write!(out, "{}", &self.filter[after_cursor..])?;
             }
             if cursor_idx >= self.filter.len() {
                 out.set_color(&self.theme.real_cursor_color(None))?;
@@ -1000,5 +1001,17 @@ mod tests {
         assert_eq!(select.cur_page, 3);
         assert_eq!(select.cursor_y, 3);
         assert_eq!(select.visible_options()[select.cursor_y].label, "15");
+    }
+
+    /// The caret's block used to slice one byte off the filter, which
+    /// panics when the char under it is multi-byte.
+    #[test]
+    fn the_filter_caret_can_be_on_a_multibyte_char() {
+        let mut select = Select::new("Pick").option(DemandOption::new("a"));
+        select.filtering = true;
+        select.filter = "éa".to_string();
+        select.cursor_x = 0;
+        let rendered = select.render().unwrap();
+        assert!(without_ansi(&rendered).contains("/éa"));
     }
 }
