@@ -4,6 +4,9 @@ use std::fmt::Display;
 use crate::height::rendered_rows;
 use std::sync::atomic::AtomicUsize;
 
+/// Options on a page until it has been laid out for a size.
+pub(crate) const DEFAULT_CAPACITY: usize = 24 - 6;
+
 /// An individual option in a select or multi-select.
 #[derive(Debug, Clone)]
 pub struct DemandOption<T> {

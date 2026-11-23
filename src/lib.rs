@@ -30,15 +30,18 @@ mod fuzzy;
 mod grid_select;
 mod handle;
 mod height;
+mod host;
 mod input;
 mod list;
 mod multiselect;
 mod option;
+mod prompt;
 mod select;
 mod spinner;
 mod synchronized_output;
 mod theme;
 mod tty;
+mod view;
 mod wizard;
 
 #[cfg(test)]

@@ -1,7 +1,9 @@
 use std::io;
-use std::io::Write;
 
-use crate::{DemandOption, ctrlc, theme};
+use crate::host::Host;
+use crate::prompt::{Outcome, Prompt};
+use crate::view::{Size, View};
+use crate::{DemandOption, theme};
 use crate::{
     input::{CTRL_N, CTRL_P},
     theme::Theme,
@@ -9,7 +11,6 @@ use crate::{
 use console::{Alignment, Key, Term};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use itertools::Itertools;
-use termcolor::{Buffer, WriteColor};
 
 /// Select a single option from a list
 ///
@@ -55,8 +56,6 @@ pub struct Select<'a, T> {
 
     cursor_x: usize,
     cursor_y: usize,
-    frame: crate::frame::Frame,
-    term: Term,
     filter: String,
     filtering: bool,
     pages: usize,
@@ -70,7 +69,7 @@ pub struct Select<'a, T> {
 impl<'a, T> Select<'a, T> {
     /// Create a new select with the given title
     pub fn new<S: Into<String>>(title: S) -> Self {
-        let mut s = Select {
+        Select {
             title: title.into(),
             description: String::new(),
             options: vec![],
@@ -78,20 +77,15 @@ impl<'a, T> Select<'a, T> {
             theme: &theme::DEFAULT,
             cursor_x: 0,
             cursor_y: 0,
-            frame: Default::default(),
-            term: Term::stderr(),
             filter: String::new(),
             filtering: false,
             pages: 0,
             cur_page: 0,
-            capacity: 0,
+            capacity: crate::option::DEFAULT_CAPACITY,
             description_fit: Default::default(),
             fuzzy_matcher: SkimMatcherV2::default().use_cache(true).smart_case(),
             updates: None,
-        };
-        let max_height = s.term.size().0 as usize;
-        s.capacity = max_height.max(8) - 6;
-        s
+        }
     }
 
     /// Set the description of the selector
@@ -162,90 +156,26 @@ impl<'a, T> Select<'a, T> {
     /// This function will block until the user submits the input. If the user cancels the input,
     /// an error of type `io::ErrorKind::Interrupted` is returned.
     pub fn run(mut self) -> io::Result<T> {
-        let ctrlc_handle = ctrlc::show_cursor_after_ctrlc(&self.term)?;
-        let mut events = crate::event::EventReader::with_updates(self.updates.as_ref())?;
-        let mut reset_viewport = false;
+        Host::new(Term::stderr()).run(&mut self, |_| Some(()))?;
+        Ok(self.into_selected().expect("an option is focused"))
+    }
 
-        loop {
-            self.apply_updates();
-            self.refresh_layout();
-            let term = self.term.clone();
-            crate::synchronized_output::run(&term, || {
-                if reset_viewport {
-                    self.term.clear_screen()?;
-                    self.frame.forget();
-                    reset_viewport = false;
-                }
-                self.draw()?;
-                self.term.hide_cursor()
-            })?;
-            let enter = |mut select: Select<T>| {
-                // An update may have arrived since the last frame: the final
-                // line should show the latest title, not the one drawn last.
-                select.apply_updates();
-                let id = select.visible_options().get(select.cursor_y).unwrap().id;
-                let selected = select.options.iter().find(|o| o.id == id).unwrap();
-                let output = select.render_success(&selected.label)?;
-                let term = select.term.clone();
-                crate::synchronized_output::run(&term, || {
-                    select.clear()?;
-                    select.term.show_cursor()?;
-                    select.term.write_all(output.as_bytes())?;
-                    select.term.clear_to_end_of_screen()
-                })?;
-                let selected = select.options.into_iter().find(|o| o.id == id).unwrap();
-                Ok::<T, io::Error>(selected.item)
-            };
+    /// The focused option's item, which is the answer once a key has been
+    /// handled with [`Outcome::Submit`]. `None` when no option matches the
+    /// filter.
+    fn selected(&self) -> Option<&T> {
+        self.visible_options()
+            .get(self.cursor_y)
+            .map(|option| &option.item)
+    }
 
-            let key = match events.read(&self.term)? {
-                crate::event::Event::Key(key) => key,
-                crate::event::Event::Resize => {
-                    reset_viewport = true;
-                    continue;
-                }
-                crate::event::Event::Update => continue,
-            };
-            if self.filtering {
-                match key {
-                    Key::ArrowDown | Key::Char(CTRL_N) => self.handle_down()?,
-                    Key::ArrowUp | Key::Char(CTRL_P) => self.handle_up()?,
-                    Key::ArrowLeft => self.handle_left()?,
-                    Key::ArrowRight => self.handle_right()?,
-                    Key::Enter if !self.visible_options().is_empty() => {
-                        return enter(self);
-                    }
-                    Key::Escape => self.handle_stop_filtering(false)?,
-                    Key::Backspace => self.handle_filter_backspace()?,
-                    Key::Char(c) if !c.is_control() => self.handle_filter_key(c)?,
-                    _ => {}
-                }
-            } else {
-                match key {
-                    Key::ArrowDown | Key::Char('j') | Key::Char(CTRL_N) => self.handle_down()?,
-                    Key::ArrowUp | Key::Char('k') | Key::Char(CTRL_P) => self.handle_up()?,
-                    Key::ArrowLeft | Key::Char('h') => self.handle_left()?,
-                    Key::ArrowRight | Key::Char('l') => self.handle_right()?,
-                    Key::Char('/') if self.filterable => self.handle_start_filtering(),
-                    Key::Escape => {
-                        if self.filter.is_empty() {
-                            self.clear()?;
-                            self.term.show_cursor()?;
-                            ctrlc_handle.close();
-                            return Err(io::Error::new(
-                                io::ErrorKind::Interrupted,
-                                "user cancelled",
-                            ));
-                        }
-                        self.handle_stop_filtering(false)?;
-                    }
-                    Key::Enter if !self.visible_options().is_empty() => {
-                        ctrlc_handle.close();
-                        return enter(self);
-                    }
-                    _ => {}
-                }
-            }
-        }
+    /// Like [`selected`](Self::selected), by value.
+    fn into_selected(self) -> Option<T> {
+        let id = self.visible_options().get(self.cursor_y)?.id;
+        self.options
+            .into_iter()
+            .find(|option| option.id == id)
+            .map(|option| option.item)
     }
 
     fn filtered_options(&self) -> Vec<&DemandOption<T>> {
@@ -273,42 +203,36 @@ impl<'a, T> Select<'a, T> {
             .collect()
     }
 
-    fn handle_down(&mut self) -> Result<(), io::Error> {
+    fn handle_down(&mut self) {
         let visible_options = self.visible_options();
         if self.cursor_y < visible_options.len().max(1) - 1 {
             self.cursor_y += 1;
         } else if self.pages > 0 && self.cur_page < self.pages - 1 {
             self.cur_page += 1;
             self.cursor_y = 0;
-            self.term.clear_to_end_of_screen()?;
         }
-        Ok(())
     }
 
-    fn handle_up(&mut self) -> Result<(), io::Error> {
+    fn handle_up(&mut self) {
         if self.cursor_y > 0 {
             self.cursor_y -= 1;
         } else if self.cur_page > 0 {
             self.cur_page -= 1;
             self.cursor_y = self.visible_options().len().max(1) - 1;
-            self.term.clear_to_end_of_screen()?;
         }
-        Ok(())
     }
 
-    fn handle_left(&mut self) -> Result<(), io::Error> {
+    fn handle_left(&mut self) {
         if self.filtering {
             if self.cursor_x > 0 {
                 self.cursor_x -= 1;
             }
         } else if self.cur_page > 0 {
             self.cur_page -= 1;
-            self.term.clear_to_end_of_screen()?;
         }
-        Ok(())
     }
 
-    fn handle_right(&mut self) -> Result<(), io::Error> {
+    fn handle_right(&mut self) {
         if self.filtering {
             if self.cursor_x < self.filter.chars().count() {
                 self.cursor_x += 1;
@@ -318,16 +242,14 @@ impl<'a, T> Select<'a, T> {
             if self.cursor_y > self.visible_options().len() - 1 {
                 self.cursor_y = self.visible_options().len() - 1;
             }
-            self.term.clear_to_end_of_screen()?;
         }
-        Ok(())
     }
 
     fn handle_start_filtering(&mut self) {
         self.filtering = true;
     }
 
-    fn handle_stop_filtering(&mut self, save: bool) -> Result<(), io::Error> {
+    fn handle_stop_filtering(&mut self, save: bool) {
         self.filtering = false;
         self.cur_page = 0;
 
@@ -336,20 +258,18 @@ impl<'a, T> Select<'a, T> {
             self.filter.clear();
             self.pages = self.get_pages();
         }
-        self.term.clear_to_end_of_screen()
     }
 
-    fn handle_filter_key(&mut self, c: char) -> Result<(), io::Error> {
+    fn handle_filter_key(&mut self, c: char) {
         let idx = self.get_char_idx(&self.filter, self.cursor_x);
         self.filter.insert(idx, c);
         self.cursor_x += 1;
         self.cursor_y = 0;
         self.cur_page = 0;
         self.pages = self.get_pages();
-        self.term.clear_to_end_of_screen()
     }
 
-    fn handle_filter_backspace(&mut self) -> Result<(), io::Error> {
+    fn handle_filter_backspace(&mut self) {
         let chars_count = self.filter.chars().count();
         if chars_count > 0 && self.cursor_x > 0 {
             let idx = self.get_char_idx(&self.filter, self.cursor_x - 1);
@@ -361,16 +281,10 @@ impl<'a, T> Select<'a, T> {
         self.cursor_y = 0;
         self.cur_page = 0;
         self.pages = self.get_pages();
-        self.term.clear_to_end_of_screen()
     }
 
     fn get_pages(&self) -> usize {
         ((self.filtered_options().len() as f64) / self.capacity as f64).ceil() as usize
-    }
-
-    fn refresh_layout(&mut self) {
-        let (rows, width) = self.term.size();
-        self.resize_layout(rows as usize, width as usize);
     }
 
     fn resize_layout(&mut self, rows: usize, width: usize) {
@@ -414,17 +328,17 @@ impl<'a, T> Select<'a, T> {
             .unwrap_or(0)
     }
 
-    fn render(&self) -> io::Result<String> {
-        let mut out = Buffer::ansi();
+    fn render(&self) -> View {
+        let mut out = View::default();
 
-        out.set_color(&self.theme.title)?;
-        write!(out, "{}", self.title)?;
+        out.set_color(&self.theme.title);
+        write!(out, "{}", self.title);
 
-        writeln!(out)?;
+        writeln!(out);
         if !self.description.is_empty() || self.pages > 1 {
-            out.set_color(&self.theme.description)?;
-            write!(out, "{}", self.description)?;
-            writeln!(out)?;
+            out.set_color(&self.theme.description);
+            write!(out, "{}", self.description);
+            writeln!(out);
         }
         // Padded to the widest label in the list, not just on this page:
         // it's what the layout measured, and descriptions line up across
@@ -439,79 +353,65 @@ impl<'a, T> Select<'a, T> {
             .enumerate()
         {
             if self.cursor_y == i {
-                out.set_color(&self.theme.cursor)?;
-                write!(out, "{}", self.theme.cursor_str)?;
+                out.set_color(&self.theme.cursor);
+                write!(out, "{}", self.theme.cursor_str);
             } else {
                 write!(
                     out,
                     "{}",
                     " ".repeat(console::measure_text_width(&self.theme.cursor_str))
-                )?;
+                );
             }
-            out.set_color(&self.theme.unselected_option)?;
+            out.set_color(&self.theme.unselected_option);
             if let Some(desc) = &option.description {
                 let label = console::pad_str(&option.label, max_label_len, Alignment::Left, None);
                 if self.filtering && !self.filter.is_empty() {
-                    self.highlight_matches(&mut out, &label)?;
+                    self.highlight_matches(&mut out, &label);
                 } else {
-                    write!(out, " {label}")?;
+                    write!(out, " {label}");
                 }
-                out.set_color(&self.theme.description)?;
+                out.set_color(&self.theme.description);
                 let indent = console::measure_text_width(&self.theme.cursor_str);
                 let desc = self
                     .description_fit
                     .fit(&format!("{} {label}  ", " ".repeat(indent)), desc);
-                writeln!(out, "  {desc}")?;
+                writeln!(out, "  {desc}");
             } else if self.filtering && !self.filter.is_empty() {
-                self.highlight_matches(&mut out, &option.label)?;
-                writeln!(out)?;
+                self.highlight_matches(&mut out, &option.label);
+                writeln!(out);
             } else {
-                writeln!(out, " {}", option.label)?;
+                writeln!(out, " {}", option.label);
             }
         }
 
         if !self.filtering && self.pages > 1 {
-            out.set_color(&self.theme.description)?;
-            writeln!(out, " (page {}/{})", self.cur_page + 1, self.pages)?;
+            out.set_color(&self.theme.description);
+            writeln!(out, " (page {}/{})", self.cur_page + 1, self.pages);
         }
 
         if self.filtering {
-            out.set_color(&self.theme.input_cursor)?;
+            out.set_color(&self.theme.input_cursor);
 
-            write!(out, "/")?;
-            out.reset()?;
+            write!(out, "/");
+            out.reset();
 
-            let cursor_idx = self.get_char_idx(&self.filter, self.cursor_x);
-            let after_cursor = self.get_char_idx(&self.filter, self.cursor_x + 1);
-            write!(out, "{}", &self.filter[..cursor_idx])?;
-
-            if cursor_idx < self.filter.len() {
-                out.set_color(&self.theme.real_cursor_color(None))?;
-                write!(out, "{}", &self.filter[cursor_idx..after_cursor])?;
-                out.reset()?;
-            }
-            if after_cursor < self.filter.len() {
-                out.reset()?;
-                write!(out, "{}", &self.filter[after_cursor..])?;
-            }
-            if cursor_idx >= self.filter.len() {
-                out.set_color(&self.theme.real_cursor_color(None))?;
-                write!(out, " ")?;
-                out.reset()?;
-            }
-            writeln!(out)?;
-            out.reset()?;
+            out.write_with_caret(
+                &self.filter,
+                self.cursor_x,
+                &self.theme.real_cursor_color(None),
+            );
+            writeln!(out);
+            out.reset();
         }
 
-        self.print_help_keys(&mut out)?;
+        self.print_help_keys(&mut out);
 
-        writeln!(out)?;
-        out.reset()?;
-
-        Ok(std::str::from_utf8(out.as_slice()).unwrap().to_string())
+        writeln!(out);
+        out.reset();
+        out
     }
 
-    fn print_help_keys(&self, out: &mut Buffer) -> io::Result<()> {
+    fn print_help_keys(&self, out: &mut View) {
         let mut help_keys = vec![("↑/↓/k/j", "up/down")];
         if self.pages > 1 {
             help_keys.push(("←/→/h/l", "prev/next page"));
@@ -527,17 +427,11 @@ impl<'a, T> Select<'a, T> {
             }
         }
         help_keys.push(("enter", "confirm"));
-        for (i, (key, desc)) in help_keys.iter().enumerate() {
-            if i > 0 || (!self.filtering && !self.filter.is_empty()) {
-                out.set_color(&self.theme.help_sep)?;
-                write!(out, " • ")?;
-            }
-            out.set_color(&self.theme.help_key)?;
-            write!(out, "{key}")?;
-            out.set_color(&self.theme.help_desc)?;
-            write!(out, " {desc}")?;
-        }
-        Ok(())
+        out.write_help(
+            self.theme,
+            &help_keys,
+            !self.filtering && !self.filter.is_empty(),
+        );
     }
 
     fn get_char_idx(&self, input: &str, cursor: usize) -> usize {
@@ -548,47 +442,84 @@ impl<'a, T> Select<'a, T> {
             .unwrap_or(input.len())
     }
 
-    fn highlight_matches(
-        &self,
-        out: &mut dyn WriteColor,
-        label: &str,
-    ) -> Result<(), std::io::Error> {
+    fn highlight_matches(&self, out: &mut View, label: &str) {
         if let Some(indices) = crate::fuzzy::indices(&self.fuzzy_matcher, label, &self.filter) {
             for (j, c) in label.chars().enumerate() {
                 if indices.contains(&j) {
-                    out.set_color(&self.theme.selected_option)?;
+                    out.set_color(&self.theme.selected_option);
                 } else {
-                    out.set_color(&self.theme.unselected_option)?;
+                    out.set_color(&self.theme.unselected_option);
                 }
                 if j == 0 {
-                    write!(out, " ")?;
+                    write!(out, " ");
                 }
-                write!(out, "{c}")?;
+                write!(out, "{c}");
             }
         } else {
-            write!(out, " {label}")?;
+            write!(out, " {label}");
         }
-        Ok(())
     }
 
-    fn render_success(&self, selected: &str) -> io::Result<String> {
-        let mut out = Buffer::ansi();
-        out.set_color(&self.theme.title)?;
-        write!(out, "{}", self.title)?;
-        out.set_color(&self.theme.selected_option)?;
-        writeln!(out, " {selected}")?;
-        out.reset()?;
-        Ok(std::str::from_utf8(out.as_slice()).unwrap().to_string())
+    fn render_success(&self, selected: &str) -> View {
+        let mut out = View::default();
+        out.set_color(&self.theme.title);
+        write!(out, "{}", self.title);
+        out.set_color(&self.theme.selected_option);
+        writeln!(out, " {selected}");
+        out.reset();
+        out
+    }
+}
+
+impl<T> Prompt for Select<'_, T> {
+    fn on_key(&mut self, key: Key) -> Outcome {
+        if self.filtering {
+            match key {
+                Key::ArrowDown | Key::Char(CTRL_N) => self.handle_down(),
+                Key::ArrowUp | Key::Char(CTRL_P) => self.handle_up(),
+                Key::ArrowLeft => self.handle_left(),
+                Key::ArrowRight => self.handle_right(),
+                Key::Enter if self.selected().is_some() => return Outcome::Submit,
+                Key::Enter => {}
+                Key::Escape => self.handle_stop_filtering(false),
+                Key::Backspace => self.handle_filter_backspace(),
+                Key::Char(c) if !c.is_control() => self.handle_filter_key(c),
+                _ => return Outcome::Ignored,
+            }
+        } else {
+            match key {
+                Key::ArrowDown | Key::Char('j') | Key::Char(CTRL_N) => self.handle_down(),
+                Key::ArrowUp | Key::Char('k') | Key::Char(CTRL_P) => self.handle_up(),
+                Key::ArrowLeft | Key::Char('h') => self.handle_left(),
+                Key::ArrowRight | Key::Char('l') => self.handle_right(),
+                Key::Char('/') if self.filterable => self.handle_start_filtering(),
+                Key::Escape if self.filter.is_empty() => return Outcome::Cancel,
+                Key::Escape => self.handle_stop_filtering(false),
+                Key::Enter if self.selected().is_some() => return Outcome::Submit,
+                Key::Enter => {}
+                _ => return Outcome::Ignored,
+            }
+        }
+        Outcome::Handled
     }
 
-    /// Render a frame and draw it over the previous one.
-    fn draw(&mut self) -> io::Result<()> {
-        let output = self.render()?;
-        self.frame.update(&self.term, output)
+    fn view(&mut self, size: Size) -> View {
+        self.apply_updates();
+        self.resize_layout(size.rows, size.width);
+        self.render()
     }
 
-    fn clear(&mut self) -> io::Result<()> {
-        self.frame.clear(&self.term)
+    fn success(&mut self) -> View {
+        // An update may have arrived since the last frame: the final line
+        // should show the latest title, not the one drawn last.
+        self.apply_updates();
+        let visible = self.visible_options();
+        let label = visible.get(self.cursor_y).map_or("", |o| o.label.as_str());
+        self.render_success(label)
+    }
+
+    fn updates(&self) -> Option<&crate::handle::Updates> {
+        self.updates.as_ref()
     }
 }
 
@@ -623,7 +554,7 @@ mod tests {
             ↑/↓/k/j up/down • enter confirm
             "
             },
-            without_ansi(select.render().unwrap().as_str())
+            without_ansi(select.render().to_ansi().as_str())
         );
     }
 
@@ -665,7 +596,7 @@ mod tests {
             ↑/↓/k/j up/down • enter confirm
             "
             },
-            without_ansi(select.render().unwrap().as_str())
+            without_ansi(select.render().to_ansi().as_str())
         );
     }
 
@@ -697,15 +628,15 @@ mod tests {
         let mut select = Select::new("Pick a script")
             .option(DemandOption::new("long").label(&"x".repeat(140)))
             .option(DemandOption::new("short"));
-        select.term = term;
-        let width = select.term.size().1 as usize;
+        let mut host = Host::new(term);
+        let width = host.term.size().1 as usize;
         // The label has to actually exceed the terminal for this to test
         // anything.
         assert!(width < 140, "test needs a label wider than the terminal");
 
         for i in 0..3 {
-            select.clear().unwrap();
-            select.draw().unwrap();
+            host.clear(&select).unwrap();
+            host.draw(&mut select).unwrap();
             // Move the cursor so consecutive frames differ and the redraw
             // path has real work to do.
             select.cursor_y = i % select.options.len();
@@ -730,13 +661,13 @@ mod tests {
         let mut select = Select::new("Pick")
             .option(DemandOption::new("one"))
             .option(DemandOption::new("two"));
-        select.term = term;
-        select.handle_down().unwrap();
-        select.draw().unwrap();
+        let mut host = Host::new(term);
+        select.handle_down();
+        host.draw(&mut select).unwrap();
         let written = snapshot(&buf).len();
 
-        select.handle_down().unwrap();
-        select.draw().unwrap();
+        select.handle_down();
+        host.draw(&mut select).unwrap();
         assert_eq!(snapshot(&buf).len(), written);
     }
 
@@ -755,26 +686,26 @@ mod tests {
         };
         let (term, buf) = capture_term();
         let mut select = Select::new("Pick").description("one").options(options());
-        select.term = term;
-        let width = select.term.size().1;
+        let mut host = Host::new(term);
+        let width = host.term.size().1;
 
-        select.draw().unwrap();
-        select.handle_down().unwrap();
-        select.draw().unwrap();
-        select.handle_down().unwrap();
-        select.draw().unwrap();
+        host.draw(&mut select).unwrap();
+        select.handle_down();
+        host.draw(&mut select).unwrap();
+        select.handle_down();
+        host.draw(&mut select).unwrap();
         select.handle_start_filtering();
-        select.draw().unwrap();
-        select.handle_filter_key('g').unwrap();
-        select.draw().unwrap();
+        host.draw(&mut select).unwrap();
+        select.handle_filter_key('g');
+        host.draw(&mut select).unwrap();
 
         let (fresh_term, fresh_buf) = capture_term();
         let mut fresh = Select::new("Pick").description("one").options(options());
         fresh.cursor_y = select.cursor_y;
         fresh.filtering = select.filtering;
         fresh.filter = select.filter.clone();
-        fresh.term = fresh_term;
-        fresh.draw().unwrap();
+        let mut fresh_host = Host::new(fresh_term);
+        fresh_host.draw(&mut fresh).unwrap();
 
         let mut patched = Parser::new(24, width, 0);
         replay(&mut patched, &snapshot(&buf));
@@ -800,7 +731,7 @@ mod tests {
         handle.set_description("50 to go");
 
         select.apply_updates();
-        let rendered = select.render().unwrap();
+        let rendered = select.render().to_ansi();
         let rendered = without_ansi(&rendered);
         assert!(rendered.starts_with("Coins: 50\n50 to go\n"), "{rendered}");
 
@@ -870,10 +801,10 @@ mod tests {
                 })
                 .collect(),
         );
-        select.term = term;
+        let mut host = Host::new(term);
         select.resize_layout(rows as usize, width as usize);
         select.cursor_y = select.visible_options().len() - 1;
-        select.draw().unwrap();
+        host.draw(&mut select).unwrap();
 
         let mut parser = Parser::new(rows, width, 0);
         replay(&mut parser, &snapshot(&buf));
@@ -905,7 +836,7 @@ mod tests {
         // down to them.
         assert_eq!(select.description_fit.rows, Some(2));
         assert_eq!(select.capacity, 9);
-        let rendered = select.render().unwrap();
+        let rendered = select.render().to_ansi();
         let rendered = without_ansi(&rendered);
         let b = rendered.lines().find(|l| l.contains(" b ")).unwrap();
         assert_eq!(console::measure_text_width(b), 160, "{b}");
@@ -929,7 +860,7 @@ mod tests {
             DemandOption::new("b").description(&"日".repeat(80 * 30)),
         ]);
         select.resize_layout(24, 80);
-        let rendered = select.render().unwrap();
+        let rendered = select.render().to_ansi();
         let b = without_ansi(&rendered)
             .lines()
             .find(|l| l.contains(" b "))
@@ -969,7 +900,7 @@ mod tests {
         );
         select.resize_layout(24, 80);
         let column = |select: &Select<i32>| {
-            let rendered = select.render().unwrap();
+            let rendered = select.render().to_ansi();
             let line = without_ansi(&rendered)
                 .lines()
                 .find(|l| l.ends_with("desc"))
@@ -1011,7 +942,7 @@ mod tests {
         select.filtering = true;
         select.filter = "éa".to_string();
         select.cursor_x = 0;
-        let rendered = select.render().unwrap();
+        let rendered = select.render().to_ansi();
         assert!(without_ansi(&rendered).contains("/éa"));
     }
 }
