@@ -10,8 +10,8 @@ use std::{
 };
 
 use console::Term;
-use termcolor::{Buffer, WriteColor};
 
+use crate::view::View;
 use crate::{Theme, ctrlc, theme};
 
 /// tell a prompt to do something while running
@@ -162,7 +162,8 @@ impl<'a> Spinner<'a> {
                 let term = self.term.clone();
                 crate::synchronized_output::run(&term, || {
                     self.clear()?;
-                    let output = self.render()?;
+                    let output = self.render(self.frame).to_ansi();
+                    self.frame += 1;
                     // `rendered_rows`, not `rendered_height`: the spinner frame
                     // has no trailing newline, so the cursor sits on its last
                     // row and that row counts.
@@ -183,23 +184,14 @@ impl<'a> Spinner<'a> {
         })
     }
 
-    /// Render the spinner and return the output
-    fn render(&mut self) -> io::Result<String> {
-        let mut out = Buffer::ansi();
-
-        if self.frame > self.style.frames.len() - 1 {
-            self.frame = 0
-        }
-
-        out.set_color(&self.theme.input_prompt)?;
-        write!(out, "{} ", self.style.frames[self.frame])?;
-        out.reset()?;
-
-        write!(out, "{}", self.title)?;
-
-        self.frame += 1;
-
-        Ok(std::str::from_utf8(out.as_slice()).unwrap().to_string())
+    fn render(&self, frame: usize) -> View {
+        let mut out = View::default();
+        out.set_color(&self.theme.input_prompt);
+        let frames = &self.style.frames;
+        write!(out, "{} ", frames[frame % frames.len()]);
+        out.reset();
+        write!(out, "{}", self.title);
+        out
     }
 
     /// Wipe the frame the cursor is currently sitting in.
@@ -312,11 +304,11 @@ mod test {
             SpinnerStyle::minidots(),
             SpinnerStyle::ellipsis(),
         ] {
-            let mut spinner = Spinner::new("Loading data...").style(&t);
-            for f in spinner.style.frames.clone().iter() {
+            let spinner = Spinner::new("Loading data...").style(&t);
+            for (frame, f) in t.frames.iter().enumerate() {
                 assert_eq!(
                     format!("{} Loading data...", f),
-                    without_ansi(spinner.render().unwrap().as_str())
+                    without_ansi(spinner.render(frame).to_ansi().as_str())
                 );
             }
         }
