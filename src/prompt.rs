@@ -14,6 +14,8 @@ pub(crate) enum Outcome {
     Submit,
     /// The user dismissed the prompt.
     Cancel,
+    /// The prompt needs the terminal to itself.
+    Edit,
 }
 
 /// What every prompt provides to be hosted.
@@ -26,6 +28,9 @@ pub(crate) trait Prompt {
 
     /// The line left behind once the prompt has been answered.
     fn success(&mut self) -> View;
+
+    /// Take over the terminal, after [`Outcome::Edit`].
+    fn edit(&mut self) {}
 
     /// How the CLI host shows the prompt.
     fn cli(&self) -> CliOptions {

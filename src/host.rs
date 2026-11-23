@@ -79,6 +79,12 @@ impl Host {
                     ctrlc_handle.close();
                     return Ok(answer);
                 }
+                Outcome::Edit => {
+                    self.clear(prompt)?;
+                    self.term.show_cursor()?;
+                    prompt.edit();
+                    self.term.hide_cursor()?;
+                }
                 Outcome::Cancel => {
                     if prompt.cli().clear_on_cancel {
                         self.clear(prompt)?;

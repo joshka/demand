@@ -7,10 +7,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use console::{Key, Term};
-use termcolor::{Buffer, WriteColor};
 
+use crate::host::Host;
+use crate::prompt::{Outcome, Prompt};
+use crate::theme;
 use crate::theme::Theme;
-use crate::{ctrlc, theme};
+use crate::view::{Size, View};
 
 /// Multi-line text input, entered in the user's text editor
 ///
@@ -45,8 +47,6 @@ pub struct Editor<'a> {
     text: String,
     extension: String,
     command: Option<OsString>,
-    term: Term,
-    frame: crate::frame::Frame,
     err: Option<String>,
 }
 
@@ -61,8 +61,6 @@ impl<'a> Editor<'a> {
             text: String::new(),
             extension: "txt".to_string(),
             command: None,
-            term: Term::stderr(),
-            frame: Default::default(),
             err: None,
         }
     }
@@ -123,52 +121,28 @@ impl<'a> Editor<'a> {
             return Ok(text);
         }
 
-        let ctrlc_handle = ctrlc::show_cursor_after_ctrlc(&self.term)?;
-        self.term.hide_cursor()?;
-        loop {
-            let term = self.term.clone();
-            crate::synchronized_output::run(&term, || self.draw())?;
-            match self.term.read_key()? {
-                Key::Char('e') => {
-                    // The editor needs the whole terminal: take the prompt
-                    // down and hand over a visible cursor until it exits.
-                    self.clear()?;
-                    self.term.show_cursor()?;
-                    let edited = self.edit();
-                    self.term.hide_cursor()?;
-                    match edited {
-                        Ok(text) => {
-                            self.text = text;
-                            self.err = None;
-                        }
-                        Err(err) => self.err = Some(err.to_string()),
-                    }
-                }
-                Key::Enter => {
-                    ctrlc_handle.close();
-                    let term = self.term.clone();
-                    crate::synchronized_output::run(&term, || {
-                        self.clear()?;
-                        self.term.show_cursor()?;
-                        let output = self.render_success()?;
-                        self.term.write_all(output.as_bytes())
-                    })?;
-                    return Ok(self.text);
-                }
-                Key::Escape => {
-                    self.clear()?;
-                    self.term.show_cursor()?;
-                    ctrlc_handle.close();
-                    return Err(io::Error::new(io::ErrorKind::Interrupted, "user cancelled"));
-                }
-                _ => {}
+        Host::new(Term::stderr()).run(&mut self, |_| Some(()))?;
+        Ok(self.text)
+    }
+
+    /// Open the text in the editor, and wait for it to exit. If that fails
+    /// the text stays as it was, and the prompt shows why.
+    ///
+    /// Call this for [`Outcome::Edit`], once the terminal has been put back
+    /// the way a program taking it over would expect.
+    fn edit(&mut self) {
+        match self.edited() {
+            Ok(text) => {
+                self.text = text;
+                self.err = None;
             }
+            Err(err) => self.err = Some(err.to_string()),
         }
     }
 
     /// Write the text to a temporary file, open it in the editor, and read
     /// it back once the editor exits.
-    fn edit(&self) -> io::Result<String> {
+    fn edited(&self) -> io::Result<String> {
         let file = TempFile::create(&self.extension, &self.text)?;
         let command = self.command.clone().unwrap_or_else(default_editor);
         let mut child = editor_command(&command, file.path())?;
@@ -211,81 +185,58 @@ impl<'a> Editor<'a> {
         fs::read_to_string(file.path())
     }
 
-    fn render(&self) -> io::Result<String> {
-        let mut out = Buffer::ansi();
+    fn render(&self) -> View {
+        let mut out = View::default();
 
-        out.set_color(&self.theme.title)?;
-        writeln!(out, "{}", self.title)?;
+        out.set_color(&self.theme.title);
+        writeln!(out, "{}", self.title);
         if !self.description.is_empty() {
-            out.set_color(&self.theme.description)?;
-            writeln!(out, "{}", self.description)?;
+            out.set_color(&self.theme.description);
+            writeln!(out, "{}", self.description);
         }
 
         let lines: Vec<&str> = self.text.lines().collect();
         if lines.is_empty() {
-            out.set_color(&self.theme.input_placeholder)?;
-            writeln!(out, "  (empty)")?;
+            out.set_color(&self.theme.input_placeholder);
+            writeln!(out, "  (empty)");
         } else {
-            out.set_color(&self.theme.unselected_option)?;
+            out.set_color(&self.theme.unselected_option);
             for line in lines.iter().take(self.preview_lines) {
-                writeln!(out, "  {line}")?;
+                writeln!(out, "  {line}");
             }
             if lines.len() > self.preview_lines {
-                out.set_color(&self.theme.description)?;
-                writeln!(out, "  … {} more lines", lines.len() - self.preview_lines)?;
+                out.set_color(&self.theme.description);
+                writeln!(out, "  … {} more lines", lines.len() - self.preview_lines);
             }
         }
 
         if let Some(err) = &self.err {
-            out.set_color(&self.theme.error_indicator)?;
-            writeln!(out, "✗ {err}")?;
+            out.set_color(&self.theme.error_indicator);
+            writeln!(out, "✗ {err}");
         }
 
-        writeln!(out)?;
-        for (i, (key, desc)) in [("e", "edit"), ("enter", "submit"), ("esc", "cancel")]
-            .iter()
-            .enumerate()
-        {
-            if i > 0 {
-                out.set_color(&self.theme.help_sep)?;
-                write!(out, " • ")?;
-            }
-            out.set_color(&self.theme.help_key)?;
-            write!(out, "{key}")?;
-            out.set_color(&self.theme.help_desc)?;
-            write!(out, " {desc}")?;
-        }
-        writeln!(out)?;
+        writeln!(out);
+        let help = [("e", "edit"), ("enter", "submit"), ("esc", "cancel")];
+        out.write_help(self.theme, &help, false);
+        writeln!(out);
 
-        out.reset()?;
-        Ok(std::str::from_utf8(out.as_slice()).unwrap().to_string())
+        out.reset();
+        out
     }
 
-    fn render_success(&self) -> io::Result<String> {
-        let mut out = Buffer::ansi();
-        out.set_color(&self.theme.title)?;
-        write!(out, "{}", self.title)?;
-        out.set_color(&self.theme.selected_option)?;
+    fn render_success(&self) -> View {
+        let mut out = View::default();
+        out.set_color(&self.theme.title);
+        write!(out, "{}", self.title);
+        out.set_color(&self.theme.selected_option);
         let mut lines = self.text.lines();
         let first = lines.next().unwrap_or_default();
         match lines.count() {
-            0 => writeln!(out, " {first}")?,
-            n => writeln!(out, " {first} (+{n} more lines)")?,
+            0 => writeln!(out, " {first}"),
+            n => writeln!(out, " {first} (+{n} more lines)"),
         }
-        out.reset()?;
-        Ok(std::str::from_utf8(out.as_slice()).unwrap().to_string())
-    }
-
-    /// Render a frame and draw it over the previous one, rewriting only
-    /// the lines that changed.
-    fn draw(&mut self) -> io::Result<()> {
-        let output = self.render()?;
-        self.frame.update(&self.term, output)
-    }
-
-    fn clear(&mut self) -> io::Result<()> {
-        self.frame.clear(&self.term)?;
-        Ok(())
+        out.reset();
+        out
     }
 }
 
@@ -441,6 +392,29 @@ impl Drop for TempFile {
     }
 }
 
+impl Prompt for Editor<'_> {
+    fn on_key(&mut self, key: Key) -> Outcome {
+        match key {
+            Key::Char('e') => Outcome::Edit,
+            Key::Enter => Outcome::Submit,
+            Key::Escape => Outcome::Cancel,
+            _ => Outcome::Ignored,
+        }
+    }
+
+    fn view(&mut self, _size: Size) -> View {
+        self.render()
+    }
+
+    fn success(&mut self) -> View {
+        self.render_success()
+    }
+
+    fn edit(&mut self) {
+        Editor::edit(self);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,7 +432,7 @@ mod tests {
 
                 e edit • enter submit • esc cancel
             "},
-            without_ansi(&editor.render().unwrap())
+            without_ansi(&editor.render().to_ansi())
         );
     }
 
@@ -476,7 +450,7 @@ mod tests {
 
                 e edit • enter submit • esc cancel
             "},
-            without_ansi(&editor.render().unwrap())
+            without_ansi(&editor.render().to_ansi())
         );
     }
 
@@ -485,12 +459,12 @@ mod tests {
         let editor = Editor::new("Notes").default_value("first\nsecond\nthird\n");
         assert_eq!(
             "Notes first (+2 more lines)\n",
-            without_ansi(&editor.render_success().unwrap())
+            without_ansi(&editor.render_success().to_ansi())
         );
         let editor = Editor::new("Notes").default_value("only");
         assert_eq!(
             "Notes only\n",
-            without_ansi(&editor.render_success().unwrap())
+            without_ansi(&editor.render_success().to_ansi())
         );
     }
 
@@ -555,7 +529,7 @@ mod tests {
                 r#"sh {} --cmd="set number""#,
                 script.path().display()
             ));
-        assert_eq!(editor.edit().unwrap(), "hello\n--cmd=set number\n");
+        assert_eq!(editor.edited().unwrap(), "hello\n--cmd=set number\n");
     }
 
     #[cfg(unix)]
@@ -564,7 +538,7 @@ mod tests {
         // The shell prints its own "not found". demand reports the exit
         // status as it is, since 127 could also come from the editor.
         let editor = Editor::new("Notes").editor_command("no-such-editor-xyz --wait");
-        let err = editor.edit().unwrap_err();
+        let err = editor.edited().unwrap_err();
         assert!(err.to_string().contains("exited with"), "{err}");
     }
 
@@ -586,14 +560,14 @@ mod tests {
         let editor = Editor::new("Notes")
             .default_value("hello\n")
             .editor_command(format!("sh {}", script.path().display()));
-        assert_eq!(editor.edit().unwrap(), "hello\nworld\n");
+        assert_eq!(editor.edited().unwrap(), "hello\nworld\n");
     }
 
     #[cfg(unix)]
     #[test]
     fn edit_reports_an_editor_that_fails() {
         let editor = Editor::new("Notes").editor_command("false");
-        let err = editor.edit().unwrap_err();
+        let err = editor.edited().unwrap_err();
         assert!(err.to_string().contains("exited with"), "{err}");
     }
 
