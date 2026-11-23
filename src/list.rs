@@ -6,7 +6,7 @@ use crate::{
     Theme,
     host::Host,
     input::{CTRL_N, CTRL_P},
-    prompt::{CliOptions, Outcome, Prompt},
+    prompt::{CliOptions, KeyPress, Outcome, Prompt},
     theme,
     view::{Size, View},
 };
@@ -124,6 +124,12 @@ impl<'a> List<'a> {
     /// an error of type `io::ErrorKind::Interrupted` is returned.
     pub fn run(mut self) -> Result<(), io::Error> {
         Host::new(Term::stderr()).run(&mut self, |_| Some(()))
+    }
+
+    /// Handle a key, for a prompt that's part of a larger interface rather
+    /// than shown with [`run`](Self::run).
+    pub fn handle_key(&mut self, key: impl Into<KeyPress>) -> Outcome {
+        self.on_key(key.into().0)
     }
 
     fn handle_up(&mut self) {

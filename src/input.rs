@@ -3,7 +3,7 @@ use std::{char, io};
 use console::{Key, Term};
 
 use crate::host::Host;
-use crate::prompt::{CliOptions, Outcome, Prompt};
+use crate::prompt::{CliOptions, KeyPress, Outcome, Prompt};
 use crate::view::{Size, View};
 use crate::{Theme, theme};
 
@@ -406,6 +406,23 @@ impl<'a> Input<'a> {
                 None
             }
         })
+    }
+
+    /// Handle a key, for a prompt that's part of a larger interface rather
+    /// than shown with [`run`](Self::run).
+    pub fn handle_key(&mut self, key: impl Into<KeyPress>) -> Outcome {
+        self.on_key(key.into().0)
+    }
+
+    /// The error being shown, if any.
+    pub fn error(&self) -> Option<&str> {
+        self.err.as_deref()
+    }
+
+    /// Show an error until the next key, such as when the text of an input
+    /// that was submitted turns out not to be usable.
+    pub fn set_error(&mut self, error: impl Into<String>) {
+        self.err = Some(error.into());
     }
 
     /// Ask for the first suggestions, before anything has been typed.

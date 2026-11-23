@@ -3,7 +3,7 @@ use std::io;
 use console::{Key, Term};
 
 use crate::host::Host;
-use crate::prompt::{CliOptions, Outcome, Prompt};
+use crate::prompt::{CliOptions, KeyPress, Outcome, Prompt};
 use crate::theme;
 use crate::theme::Theme;
 use crate::view::{Size, View};
@@ -190,6 +190,12 @@ impl<'a> Confirm<'a> {
         }
 
         Host::new(Term::stderr()).run(&mut self, |confirm| Some(confirm.selected))
+    }
+
+    /// Handle a key, for a prompt that's part of a larger interface rather
+    /// than shown with [`run`](Self::run).
+    pub fn handle_key(&mut self, key: impl Into<KeyPress>) -> Outcome {
+        self.on_key(key.into().0)
     }
 
     fn handle_left(&mut self) {

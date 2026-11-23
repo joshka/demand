@@ -13,6 +13,7 @@ pub use input::{
 pub use list::List;
 pub use multiselect::MultiSelect;
 pub use option::DemandOption;
+pub use prompt::{KeyPress, Outcome};
 pub use select::Select;
 pub use spinner::Spinner;
 pub use spinner::SpinnerStyle;

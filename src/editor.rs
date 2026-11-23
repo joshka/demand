@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use console::{Key, Term};
 
 use crate::host::Host;
-use crate::prompt::{Outcome, Prompt};
+use crate::prompt::{KeyPress, Outcome, Prompt};
 use crate::theme;
 use crate::theme::Theme;
 use crate::view::{Size, View};
@@ -125,12 +125,18 @@ impl<'a> Editor<'a> {
         Ok(self.text)
     }
 
+    /// Handle a key, for a prompt that's part of a larger interface rather
+    /// than shown with [`run`](Self::run).
+    pub fn handle_key(&mut self, key: impl Into<KeyPress>) -> Outcome {
+        self.on_key(key.into().0)
+    }
+
     /// Open the text in the editor, and wait for it to exit. If that fails
     /// the text stays as it was, and the prompt shows why.
     ///
     /// Call this for [`Outcome::Edit`], once the terminal has been put back
     /// the way a program taking it over would expect.
-    fn edit(&mut self) {
+    pub fn edit(&mut self) {
         match self.edited() {
             Ok(text) => {
                 self.text = text;
@@ -138,6 +144,16 @@ impl<'a> Editor<'a> {
             }
             Err(err) => self.err = Some(err.to_string()),
         }
+    }
+
+    /// The text entered so far.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Why the text couldn't be edited, if it couldn't.
+    pub fn error(&self) -> Option<&str> {
+        self.err.as_deref()
     }
 
     /// Write the text to a temporary file, open it in the editor, and read

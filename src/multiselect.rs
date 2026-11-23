@@ -6,7 +6,7 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use itertools::Itertools;
 
 use crate::host::Host;
-use crate::prompt::{Outcome, Prompt};
+use crate::prompt::{KeyPress, Outcome, Prompt};
 use crate::view::{Size, View};
 use crate::{DemandOption, theme};
 use crate::{
@@ -176,8 +176,24 @@ impl<'a, T> MultiSelect<'a, T> {
         Ok(self.into_selected())
     }
 
-    /// The items of the selected options.
-    fn into_selected(self) -> Vec<T> {
+    /// Handle a key, for a prompt that's part of a larger interface rather
+    /// than shown with [`run`](Self::run).
+    pub fn handle_key(&mut self, key: impl Into<KeyPress>) -> Outcome {
+        self.on_key(key.into().0)
+    }
+
+    /// The items of the selected options, which are the answer once a key
+    /// has been handled with [`Outcome::Submit`].
+    pub fn selected(&self) -> Vec<&T> {
+        self.options
+            .iter()
+            .filter(|option| option.selected)
+            .map(|option| &option.item)
+            .collect()
+    }
+
+    /// Like [`selected`](Self::selected), by value.
+    pub fn into_selected(self) -> Vec<T> {
         self.options
             .into_iter()
             .filter(|option| option.selected)

@@ -1,7 +1,7 @@
 use std::io;
 
 use crate::host::Host;
-use crate::prompt::{Outcome, Prompt};
+use crate::prompt::{KeyPress, Outcome, Prompt};
 use crate::view::{Size, View};
 use crate::{DemandOption, theme};
 use crate::{
@@ -160,17 +160,23 @@ impl<'a, T> Select<'a, T> {
         Ok(self.into_selected().expect("an option is focused"))
     }
 
+    /// Handle a key, for a prompt that's part of a larger interface rather
+    /// than shown with [`run`](Self::run).
+    pub fn handle_key(&mut self, key: impl Into<KeyPress>) -> Outcome {
+        self.on_key(key.into().0)
+    }
+
     /// The focused option's item, which is the answer once a key has been
     /// handled with [`Outcome::Submit`]. `None` when no option matches the
     /// filter.
-    fn selected(&self) -> Option<&T> {
+    pub fn selected(&self) -> Option<&T> {
         self.visible_options()
             .get(self.cursor_y)
             .map(|option| &option.item)
     }
 
     /// Like [`selected`](Self::selected), by value.
-    fn into_selected(self) -> Option<T> {
+    pub fn into_selected(self) -> Option<T> {
         let id = self.visible_options().get(self.cursor_y)?.id;
         self.options
             .into_iter()

@@ -5,7 +5,7 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use itertools::Itertools;
 
 use crate::host::Host;
-use crate::prompt::{Outcome, Prompt};
+use crate::prompt::{KeyPress, Outcome, Prompt};
 use crate::theme;
 use crate::theme::Theme;
 use crate::view::{Size, View};
@@ -239,8 +239,24 @@ impl<'a, T> GridSelect<'a, T> {
         Ok(self.into_selected())
     }
 
-    /// Every row's item with the index of the column chosen for it.
-    fn into_selected(mut self) -> Vec<(T, usize)> {
+    /// Handle a key, for a prompt that's part of a larger interface rather
+    /// than shown with [`run`](Self::run).
+    pub fn handle_key(&mut self, key: impl Into<KeyPress>) -> Outcome {
+        self.on_key(key.into().0)
+    }
+
+    /// Every row's item with the index of the column chosen for it, which
+    /// are the answer once a key has been handled with [`Outcome::Submit`].
+    pub fn selected(&self) -> Vec<(&T, usize)> {
+        self.rows
+            .iter()
+            .filter(|row| row.cells.iter().any(Option::is_some))
+            .map(|row| (&row.item, row.selected))
+            .collect()
+    }
+
+    /// Like [`selected`](Self::selected), by value.
+    pub fn into_selected(mut self) -> Vec<(T, usize)> {
         self.prepare();
         self.rows
             .into_iter()

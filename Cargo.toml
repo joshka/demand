@@ -9,8 +9,13 @@ readme = "README.md"
 keywords = ["cli", "prompt", "console"]
 include = ["src/**/*", "examples/**/*", "README.md", "CHANGELOG.md", "LICENSE"]
 
+[features]
+# Pass crossterm key events to prompts.
+crossterm = ["dep:crossterm"]
+
 [dependencies]
 console = "0.16"
+crossterm = { version = "0.29", optional = true }
 fuzzy-matcher = "0.3"
 itertools = "0.15"
 signal-hook = "0.4"
