@@ -1,13 +1,14 @@
 use std::io;
 
 use console::{Key, Term};
-use std::io::Write;
-use termcolor::{Buffer, WriteColor};
 
 use crate::{
-    Theme, ctrlc,
+    Theme,
+    host::Host,
     input::{CTRL_N, CTRL_P},
+    prompt::{CliOptions, Outcome, Prompt},
     theme,
+    view::{Size, View},
 };
 
 /// Display a list of options
@@ -50,14 +51,12 @@ pub struct List<'a> {
     /// Colors/style of the list
     pub theme: &'a Theme,
 
-    term: Term,
     items: Vec<&'a str>,
     capacity: usize,
     filtering: bool,
     filterable: bool,
     filter: String,
     cur_page: usize,
-    frame: crate::frame::Frame,
     pages: usize,
     scroll: usize,
 }
@@ -65,25 +64,20 @@ pub struct List<'a> {
 impl<'a> List<'a> {
     /// Creates a new list with a title
     pub fn new<S: Into<String>>(title: S) -> Self {
-        let mut s = Self {
+        Self {
             title: title.into(),
             description: String::new(),
             theme: &theme::DEFAULT,
             items: Vec::new(),
-            term: Term::stderr(),
-            capacity: 0,
+            capacity: 24 - 5,
             filtering: false,
             filterable: false,
             filter: String::new(),
-            frame: Default::default(),
             cur_page: 0,
             pages: 0,
             success_items: 4,
             scroll: 0,
-        };
-        let max_height = s.term.size().0 as usize;
-        s.capacity = max_height.max(8) - 5;
-        s
+        }
     }
 
     /// Sets the description of the list
@@ -129,68 +123,7 @@ impl<'a> List<'a> {
     /// This function will block until the user submits the input. If the user cancels the input,
     /// an error of type `io::ErrorKind::Interrupted` is returned.
     pub fn run(mut self) -> Result<(), io::Error> {
-        let ctrlc_handle = ctrlc::show_cursor_after_ctrlc(&self.term)?;
-        let mut events = crate::event::EventReader::new()?;
-        let mut reset_viewport = false;
-
-        loop {
-            self.refresh_layout();
-            let term = self.term.clone();
-            crate::synchronized_output::run(&term, || {
-                if self.frame.is_empty() {
-                    // Start the first frame on a clean line.
-                    self.term.clear_line()?;
-                }
-                if reset_viewport {
-                    self.term.clear_screen()?;
-                    self.frame.forget();
-                    reset_viewport = false;
-                }
-                let output = self.render()?;
-                self.frame.update(&self.term, output)
-            })?;
-            let Some(key) = events.read_key(&self.term)? else {
-                reset_viewport = true;
-                continue;
-            };
-            if self.filtering {
-                match key {
-                    Key::ArrowDown | Key::Char(CTRL_N) => self.handle_down()?,
-                    Key::ArrowUp | Key::Char(CTRL_P) => self.handle_up(),
-                    Key::Enter => self.handle_stop_filtering(true)?,
-                    Key::Escape => self.handle_stop_filtering(false)?,
-                    Key::Backspace => self.handle_filter_backspace()?,
-                    Key::Char(c) if !c.is_control() => self.handle_filter_key(c)?,
-                    _ => {}
-                }
-            } else {
-                self.term.hide_cursor()?;
-                match key {
-                    Key::ArrowDown | Key::Char('j') | Key::Char(CTRL_N) => self.handle_down()?,
-                    Key::ArrowUp | Key::Char('k') | Key::Char(CTRL_P) => self.handle_up(),
-                    Key::ArrowLeft | Key::Char('h') => self.handle_left()?,
-                    Key::ArrowRight | Key::Char('l') => self.handle_right()?,
-                    Key::Char('/') if self.filterable => self.handle_start_filtering(),
-                    Key::Escape => {
-                        self.term.show_cursor()?;
-                        ctrlc_handle.close();
-                        return Err(io::Error::new(io::ErrorKind::Interrupted, "user cancelled"));
-                    }
-                    Key::Enter => {
-                        ctrlc_handle.close();
-                        let term = self.term.clone();
-                        crate::synchronized_output::run(&term, || {
-                            self.clear()?;
-                            self.term.show_cursor()?;
-                            let output = self.render_success()?;
-                            self.term.write_all(output.as_bytes())
-                        })?;
-                        return Ok(());
-                    }
-                    _ => {}
-                }
-            }
-        }
+        Host::new(Term::stderr()).run(&mut self, |_| Some(()))
     }
 
     fn handle_up(&mut self) {
@@ -200,58 +133,49 @@ impl<'a> List<'a> {
         }
     }
 
-    fn handle_down(&mut self) -> Result<(), io::Error> {
+    fn handle_down(&mut self) {
         let saturating_sub = self.filtered_entries().len().saturating_sub(self.capacity);
         if self.scroll < saturating_sub {
             self.scroll += 1;
             self.pages = self.get_pages();
-            self.term.clear_to_end_of_screen()?;
         }
-        Ok(())
     }
 
-    fn handle_left(&mut self) -> Result<(), io::Error> {
+    fn handle_left(&mut self) {
         if self.cur_page > 0 {
             self.cur_page -= 1;
-            self.term.clear_to_end_of_screen()?;
         }
-        Ok(())
     }
 
-    fn handle_right(&mut self) -> Result<(), io::Error> {
+    fn handle_right(&mut self) {
         if self.pages > 0 && self.cur_page < self.pages - 1 {
             self.cur_page += 1;
-            self.term.clear_to_end_of_screen()?;
         }
-        Ok(())
     }
 
     fn handle_start_filtering(&mut self) {
         self.filtering = true;
     }
 
-    fn handle_stop_filtering(&mut self, save: bool) -> Result<(), io::Error> {
+    fn handle_stop_filtering(&mut self, save: bool) {
         self.filtering = false;
         self.cur_page = 0;
         if !save {
             self.filter.clear();
             self.pages = self.get_pages();
         }
-        self.term.clear_to_end_of_screen()
     }
 
-    fn handle_filter_backspace(&mut self) -> Result<(), io::Error> {
+    fn handle_filter_backspace(&mut self) {
         self.filter.pop();
         self.scroll = 0;
         self.pages = self.get_pages();
-        self.term.clear_to_end_of_screen()
     }
 
-    fn handle_filter_key(&mut self, key: char) -> Result<(), io::Error> {
+    fn handle_filter_key(&mut self, key: char) {
         self.filter.push(key);
         self.scroll = 0;
         self.pages = self.get_pages();
-        self.term.clear_to_end_of_screen()
     }
 
     fn filtered_entries(&self) -> Vec<&&'a str> {
@@ -270,10 +194,6 @@ impl<'a> List<'a> {
         } else {
             ((self.items.len() - self.scroll) as f64 / self.capacity as f64).ceil() as usize
         }
-    }
-
-    fn refresh_layout(&mut self) {
-        self.resize_layout(self.term.size().0 as usize);
     }
 
     fn resize_layout(&mut self, rows: usize) {
@@ -300,36 +220,36 @@ impl<'a> List<'a> {
             .collect()
     }
 
-    fn render(&self) -> Result<String, io::Error> {
-        let mut out = Buffer::ansi();
+    fn render(&self) -> View {
+        let mut out = View::default();
 
-        out.set_color(&self.theme.title)?;
-        write!(out, "{}", self.title)?;
+        out.set_color(&self.theme.title);
+        write!(out, "{}", self.title);
 
-        writeln!(out)?;
+        writeln!(out);
         if !self.description.is_empty() {
-            out.set_color(&self.theme.description)?;
-            write!(out, "{}", self.description)?;
-            writeln!(out)?;
+            out.set_color(&self.theme.description);
+            write!(out, "{}", self.description);
+            writeln!(out);
         }
         for entry in self.visible_entries().iter() {
-            out.set_color(&self.theme.unselected_option)?;
-            writeln!(out, "  {entry}")?;
+            out.set_color(&self.theme.unselected_option);
+            writeln!(out, "  {entry}");
         }
         if self.pages > 1 {
-            out.set_color(&self.theme.description)?;
-            writeln!(out, " (page {}/{})", self.cur_page + 1, self.pages)?;
+            out.set_color(&self.theme.description);
+            writeln!(out, " (page {}/{})", self.cur_page + 1, self.pages);
         }
         if self.filtering {
-            out.set_color(&self.theme.input_cursor)?;
-            write!(out, "/")?;
-            out.reset()?;
-            write!(out, "{}", self.filter)?;
-            out.set_color(&self.theme.real_cursor_color(None))?;
-            writeln!(out, " ")?;
+            out.set_color(&self.theme.input_cursor);
+            write!(out, "/");
+            out.reset();
+            write!(out, "{}", self.filter);
+            out.set_color(&self.theme.real_cursor_color(None));
+            writeln!(out, " ");
         } else if !self.filter.is_empty() {
-            out.set_color(&self.theme.description)?;
-            write!(out, "/{}", self.filter)?;
+            out.set_color(&self.theme.description);
+            write!(out, "/{}", self.filter);
         }
         let mut help_keys = vec![("↑/↓/k/j", "up/down")];
         if self.pages > 1 {
@@ -345,45 +265,81 @@ impl<'a> List<'a> {
         if !self.filtering {
             help_keys.push(("enter", "done"));
         }
-        for (i, (key, desc)) in help_keys.iter().enumerate() {
-            if i > 0 || (!self.filtering && !self.filter.is_empty()) {
-                out.set_color(&self.theme.help_sep)?;
-                write!(out, " • ")?;
-            }
-            out.set_color(&self.theme.help_key)?;
-            write!(out, "{key}")?;
-            out.set_color(&self.theme.help_desc)?;
-            write!(out, " {desc}")?;
-        }
+        out.write_help(
+            self.theme,
+            &help_keys,
+            !self.filtering && !self.filter.is_empty(),
+        );
 
-        writeln!(out)?;
+        writeln!(out);
 
-        out.reset()?;
-        Ok(std::str::from_utf8(out.as_slice()).unwrap().to_string())
+        out.reset();
+        out
     }
 
-    fn render_success(&self) -> Result<String, io::Error> {
-        let mut out = Buffer::ansi();
+    fn render_success(&self) -> View {
+        let mut out = View::default();
 
-        out.set_color(&self.theme.title)?;
-        write!(out, "{}", self.title)?;
+        out.set_color(&self.theme.title);
+        write!(out, "{}", self.title);
 
         for entry in self.items.iter().take(self.success_items) {
-            out.set_color(&self.theme.unselected_option)?;
-            write!(out, "  {entry},")?;
+            out.set_color(&self.theme.unselected_option);
+            write!(out, "  {entry},");
         }
         if self.items.len() > self.success_items {
-            write!(out, " ...")?;
+            write!(out, " ...");
         }
 
-        writeln!(out)?;
+        writeln!(out);
 
-        out.reset()?;
-        Ok(std::str::from_utf8(out.as_slice()).unwrap().to_string())
+        out.reset();
+        out
+    }
+}
+
+impl Prompt for List<'_> {
+    fn on_key(&mut self, key: Key) -> Outcome {
+        if self.filtering {
+            match key {
+                Key::ArrowDown | Key::Char(CTRL_N) => self.handle_down(),
+                Key::ArrowUp | Key::Char(CTRL_P) => self.handle_up(),
+                Key::Enter => self.handle_stop_filtering(true),
+                Key::Escape => self.handle_stop_filtering(false),
+                Key::Backspace => self.handle_filter_backspace(),
+                Key::Char(c) if !c.is_control() => self.handle_filter_key(c),
+                _ => return Outcome::Ignored,
+            }
+        } else {
+            match key {
+                Key::ArrowDown | Key::Char('j') | Key::Char(CTRL_N) => self.handle_down(),
+                Key::ArrowUp | Key::Char('k') | Key::Char(CTRL_P) => self.handle_up(),
+                Key::ArrowLeft | Key::Char('h') => self.handle_left(),
+                Key::ArrowRight | Key::Char('l') => self.handle_right(),
+                Key::Char('/') if self.filterable => self.handle_start_filtering(),
+                Key::Escape => return Outcome::Cancel,
+                Key::Enter => return Outcome::Submit,
+                _ => return Outcome::Ignored,
+            }
+        }
+        Outcome::Handled
     }
 
-    fn clear(&mut self) -> Result<(), io::Error> {
-        self.frame.clear(&self.term)
+    fn view(&mut self, size: Size) -> View {
+        self.resize_layout(size.rows);
+        self.render()
+    }
+
+    fn success(&mut self) -> View {
+        self.render_success()
+    }
+
+    fn cli(&self) -> CliOptions {
+        CliOptions {
+            clear_line: true,
+            clear_on_cancel: false,
+            ..Default::default()
+        }
     }
 }
 
@@ -414,7 +370,7 @@ mod tests {
                 ",
 
             },
-            without_ansi(list.render().unwrap().as_str())
+            without_ansi(list.render().to_ansi().as_str())
         )
     }
 
