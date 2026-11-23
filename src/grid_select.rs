@@ -1,13 +1,14 @@
 use std::io;
-use std::io::Write;
 
 use console::{Key, Term};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use itertools::Itertools;
-use termcolor::{Buffer, WriteColor};
 
+use crate::host::Host;
+use crate::prompt::{Outcome, Prompt};
+use crate::theme;
 use crate::theme::Theme;
-use crate::{ctrlc, theme};
+use crate::view::{Size, View};
 
 /// Pick one column for each row of a table
 ///
@@ -67,8 +68,6 @@ pub struct GridSelect<'a, T> {
     /// Position of the focused row among the filtered rows.
     cursor: usize,
     capacity: usize,
-    frame: crate::frame::Frame,
-    term: Term,
     fuzzy_matcher: SkimMatcherV2,
 }
 
@@ -184,9 +183,7 @@ impl<'a, T> GridSelect<'a, T> {
             filtering: false,
             filter: String::new(),
             cursor: 0,
-            capacity: 1,
-            frame: Default::default(),
-            term: Term::stderr(),
+            capacity: crate::option::DEFAULT_CAPACITY,
             fuzzy_matcher: SkimMatcherV2::default().use_cache(true).smart_case(),
         }
     }
@@ -238,65 +235,17 @@ impl<'a, T> GridSelect<'a, T> {
     /// This function will block until the user submits the input. If the user cancels the input,
     /// an error of type `io::ErrorKind::Interrupted` is returned.
     pub fn run(mut self) -> io::Result<Vec<(T, usize)>> {
-        let ctrlc_handle = ctrlc::show_cursor_after_ctrlc(&self.term)?;
-        let mut events = crate::event::EventReader::new()?;
-        let mut reset_viewport = false;
+        Host::new(Term::stderr()).run(&mut self, |_| Some(()))?;
+        Ok(self.into_selected())
+    }
 
+    /// Every row's item with the index of the column chosen for it.
+    fn into_selected(mut self) -> Vec<(T, usize)> {
         self.prepare();
-
-        loop {
-            let (term_rows, term_cols) = self.term.size();
-            self.capacity = self.capacity_for(term_rows as usize, term_cols as usize);
-            let term = self.term.clone();
-            crate::synchronized_output::run(&term, || {
-                if reset_viewport {
-                    self.term.clear_screen()?;
-                    self.frame.forget();
-                    reset_viewport = false;
-                }
-                self.redraw()
-            })?;
-
-            let Some(key) = events.read_key(&self.term)? else {
-                reset_viewport = true;
-                continue;
-            };
-            if !self.filtering {
-                self.term.hide_cursor()?;
-            }
-            match key {
-                Key::ArrowDown => self.handle_down(),
-                Key::ArrowUp => self.handle_up(),
-                Key::ArrowLeft => self.handle_step(-1),
-                Key::ArrowRight => self.handle_step(1),
-                Key::PageDown => self.handle_page(1),
-                Key::PageUp => self.handle_page(-1),
-                // Like `List`: Enter applies the filter being typed, and
-                // only confirms the grid once filtering is done.
-                Key::Enter if self.filtering => self.filtering = false,
-                Key::Enter => {
-                    ctrlc_handle.close();
-                    return self.finish();
-                }
-                Key::Escape if self.filtering || !self.filter.is_empty() => {
-                    self.handle_clear_filter()
-                }
-                Key::Escape => {
-                    self.frame.clear(&self.term)?;
-                    self.term.show_cursor()?;
-                    ctrlc_handle.close();
-                    return Err(io::Error::new(io::ErrorKind::Interrupted, "user cancelled"));
-                }
-                Key::Backspace if self.filtering => self.handle_filter_backspace(),
-                Key::Char(c) if self.filtering => self.handle_filter_key(c),
-                Key::Char('j') => self.handle_down(),
-                Key::Char('k') => self.handle_up(),
-                Key::Char('h') => self.handle_step(-1),
-                Key::Char('l') => self.handle_step(1),
-                Key::Char('/') if self.filterable => self.filtering = true,
-                _ => {}
-            }
-        }
+        self.rows
+            .into_iter()
+            .map(|row| (row.item, row.selected))
+            .collect()
     }
 
     fn prepare(&mut self) {
@@ -317,24 +266,6 @@ impl<'a, T> GridSelect<'a, T> {
             row.normalize();
         }
         self.columns.resize(width, String::new());
-        let (term_rows, term_cols) = self.term.size();
-        self.capacity = self.capacity_for(term_rows as usize, term_cols as usize);
-    }
-
-    fn finish(mut self) -> io::Result<Vec<(T, usize)>> {
-        let output = self.render_success()?;
-        let term = self.term.clone();
-        crate::synchronized_output::run(&term, || {
-            self.frame.clear(&self.term)?;
-            self.term.show_cursor()?;
-            self.term.write_all(output.as_bytes())?;
-            self.term.clear_to_end_of_screen()
-        })?;
-        Ok(self
-            .rows
-            .into_iter()
-            .map(|row| (row.item, row.selected))
-            .collect())
     }
 
     /// How many rows fit on one page of a `term_rows` × `term_cols`
@@ -465,16 +396,16 @@ impl<'a, T> GridSelect<'a, T> {
             .collect()
     }
 
-    fn render(&self) -> io::Result<String> {
-        let mut out = Buffer::ansi();
+    fn render(&self) -> View {
+        let mut out = View::default();
 
-        out.set_color(&self.theme.title)?;
-        writeln!(out, "{}", self.title)?;
+        out.set_color(&self.theme.title);
+        writeln!(out, "{}", self.title);
         let filtered = self.filtered();
         let pages = self.pages(filtered.len());
         if !self.description.is_empty() {
-            out.set_color(&self.theme.description)?;
-            writeln!(out, "{}", self.description)?;
+            out.set_color(&self.theme.description);
+            writeln!(out, "{}", self.description);
         }
 
         let label_width = self
@@ -485,28 +416,28 @@ impl<'a, T> GridSelect<'a, T> {
             .unwrap_or(0);
         let widths = self.column_widths();
 
-        out.set_color(&self.theme.description)?;
+        out.set_color(&self.theme.description);
         let mut pad = 3 + label_width;
         for (header, width) in self.columns.iter().zip(&widths) {
-            write!(out, "{}{header}", " ".repeat(pad + 2))?;
+            write!(out, "{}{header}", " ".repeat(pad + 2));
             pad = width - console::measure_text_width(header);
         }
-        writeln!(out)?;
+        writeln!(out);
 
         let start = self.page() * self.capacity;
         for (pos, &i) in filtered.iter().enumerate().skip(start).take(self.capacity) {
             let row = &self.rows[i];
             if pos == self.cursor {
-                out.set_color(&self.theme.cursor)?;
-                write!(out, " > ")?;
+                out.set_color(&self.theme.cursor);
+                write!(out, " > ");
             } else {
-                write!(out, "   ")?;
+                write!(out, "   ");
             }
-            out.set_color(&self.theme.unselected_option)?;
+            out.set_color(&self.theme.unselected_option);
             if self.filtering && !self.filter.is_empty() {
-                self.highlight_matches(&mut out, &row.label)?;
+                self.highlight_matches(&mut out, &row.label);
             } else {
-                write!(out, "{}", row.label)?;
+                write!(out, "{}", row.label);
             }
             // Padding is only written ahead of the next cell, so rows
             // carry no trailing whitespace.
@@ -517,7 +448,7 @@ impl<'a, T> GridSelect<'a, T> {
                     pad += width;
                     continue;
                 };
-                write!(out, "{}", " ".repeat(pad))?;
+                write!(out, "{}", " ".repeat(pad));
                 let (prefix, prefix_fg, text_color) = if row.selected == c {
                     (
                         &self.theme.selected_prefix,
@@ -531,43 +462,42 @@ impl<'a, T> GridSelect<'a, T> {
                         &self.theme.unselected_option,
                     )
                 };
-                out.set_color(prefix_fg)?;
-                write!(out, "{prefix}")?;
-                out.set_color(text_color)?;
-                write!(out, " {text}")?;
+                out.set_color(prefix_fg);
+                write!(out, "{prefix}");
+                out.set_color(text_color);
+                write!(out, " {text}");
                 let used =
                     console::measure_text_width(prefix) + 1 + console::measure_text_width(text);
                 pad = width.saturating_sub(used);
             }
-            out.reset()?;
-            writeln!(out)?;
+            out.reset();
+            writeln!(out);
         }
 
         if pages > 1 {
-            out.set_color(&self.theme.description)?;
-            writeln!(out, " (page {}/{})", self.page() + 1, pages)?;
+            out.set_color(&self.theme.description);
+            writeln!(out, " (page {}/{})", self.page() + 1, pages);
         }
 
         if self.filtering {
-            out.set_color(&self.theme.input_cursor)?;
-            write!(out, "/")?;
-            out.reset()?;
-            write!(out, "{}", self.filter)?;
-            out.set_color(&self.theme.real_cursor_color(None))?;
-            write!(out, " ")?;
-            out.reset()?;
-            writeln!(out)?;
+            out.set_color(&self.theme.input_cursor);
+            write!(out, "/");
+            out.reset();
+            write!(out, "{}", self.filter);
+            out.set_color(&self.theme.real_cursor_color(None));
+            write!(out, " ");
+            out.reset();
+            writeln!(out);
         } else if !self.filter.is_empty() {
-            out.set_color(&self.theme.description)?;
-            write!(out, "/{} ", self.filter)?;
+            out.set_color(&self.theme.description);
+            write!(out, "/{} ", self.filter);
         }
 
-        self.print_help_keys(&mut out, pages)?;
+        self.print_help_keys(&mut out, pages);
 
-        writeln!(out)?;
-        out.reset()?;
-
-        Ok(std::str::from_utf8(out.as_slice()).unwrap().to_string())
+        writeln!(out);
+        out.reset();
+        out
     }
 
     fn help_keys(&self, pages: usize) -> Vec<(&'static str, &'static str)> {
@@ -592,38 +522,27 @@ impl<'a, T> GridSelect<'a, T> {
         help_keys
     }
 
-    fn print_help_keys(&self, out: &mut Buffer, pages: usize) -> io::Result<()> {
-        for (i, (key, desc)) in self.help_keys(pages).iter().enumerate() {
-            if i > 0 {
-                out.set_color(&self.theme.help_sep)?;
-                write!(out, " • ")?;
-            }
-            out.set_color(&self.theme.help_key)?;
-            write!(out, "{key}")?;
-            out.set_color(&self.theme.help_desc)?;
-            write!(out, " {desc}")?;
-        }
-        Ok(())
+    fn print_help_keys(&self, out: &mut View, pages: usize) {
+        out.write_help(self.theme, &self.help_keys(pages), false);
     }
 
-    fn highlight_matches(&self, out: &mut dyn WriteColor, label: &str) -> io::Result<()> {
+    fn highlight_matches(&self, out: &mut View, label: &str) {
         let indices =
             crate::fuzzy::indices(&self.fuzzy_matcher, label, &self.filter).unwrap_or_default();
         for (j, c) in label.chars().enumerate() {
             if indices.contains(&j) {
-                out.set_color(&self.theme.selected_option)?;
+                out.set_color(&self.theme.selected_option);
             } else {
-                out.set_color(&self.theme.unselected_option)?;
+                out.set_color(&self.theme.unselected_option);
             }
-            write!(out, "{c}")?;
+            write!(out, "{c}");
         }
-        Ok(())
     }
 
-    fn render_success(&self) -> io::Result<String> {
-        let mut out = Buffer::ansi();
-        out.set_color(&self.theme.title)?;
-        write!(out, "{}", self.title)?;
+    fn render_success(&self) -> View {
+        let mut out = View::default();
+        out.set_color(&self.theme.title);
+        write!(out, "{}", self.title);
         let changed = self
             .rows
             .iter()
@@ -633,16 +552,49 @@ impl<'a, T> GridSelect<'a, T> {
                 Some(format!("{} {text}", row.label))
             })
             .join(", ");
-        out.set_color(&self.theme.selected_option)?;
-        writeln!(out, " {changed}")?;
-        out.reset()?;
-        Ok(std::str::from_utf8(out.as_slice()).unwrap().to_string())
+        out.set_color(&self.theme.selected_option);
+        writeln!(out, " {changed}");
+        out.reset();
+        out
+    }
+}
+
+impl<T> Prompt for GridSelect<'_, T> {
+    fn on_key(&mut self, key: Key) -> Outcome {
+        self.prepare();
+        match key {
+            Key::ArrowDown => self.handle_down(),
+            Key::ArrowUp => self.handle_up(),
+            Key::ArrowLeft => self.handle_step(-1),
+            Key::ArrowRight => self.handle_step(1),
+            Key::PageDown => self.handle_page(1),
+            Key::PageUp => self.handle_page(-1),
+            // Like `List`: Enter applies the filter being typed, and
+            // only confirms the grid once filtering is done.
+            Key::Enter if self.filtering => self.filtering = false,
+            Key::Enter => return Outcome::Submit,
+            Key::Escape if self.filtering || !self.filter.is_empty() => self.handle_clear_filter(),
+            Key::Escape => return Outcome::Cancel,
+            Key::Backspace if self.filtering => self.handle_filter_backspace(),
+            Key::Char(c) if self.filtering => self.handle_filter_key(c),
+            Key::Char('j') => self.handle_down(),
+            Key::Char('k') => self.handle_up(),
+            Key::Char('h') => self.handle_step(-1),
+            Key::Char('l') => self.handle_step(1),
+            Key::Char('/') if self.filterable => self.filtering = true,
+            _ => return Outcome::Ignored,
+        }
+        Outcome::Handled
     }
 
-    /// Render a frame and draw it over the previous one.
-    fn redraw(&mut self) -> io::Result<()> {
-        let output = self.render()?;
-        self.frame.update(&self.term, output)
+    fn view(&mut self, size: Size) -> View {
+        self.prepare();
+        self.capacity = self.capacity_for(size.rows, size.width);
+        self.render()
+    }
+
+    fn success(&mut self) -> View {
+        self.render_success()
     }
 }
 
@@ -689,7 +641,7 @@ mod tests {
             ↑/↓/k/j up/down • ←/→/h/l choose • enter confirm
             "
             },
-            without_ansi(grid.render().unwrap().as_str())
+            without_ansi(grid.render().to_ansi().as_str())
         );
     }
 
@@ -732,7 +684,7 @@ mod tests {
         grid.handle_step(1);
         assert_eq!(grid.rows[2].selected, 1);
         assert_eq!(grid.rows[0].selected, 0);
-        let rendered = without_ansi(&grid.render().unwrap()).to_string();
+        let rendered = without_ansi(&grid.render().to_ansi()).to_string();
         assert!(rendered.contains(" > jest"), "{rendered}");
         assert!(!rendered.contains("react"), "{rendered}");
         assert!(rendered.contains("enter apply filter"), "{rendered}");
@@ -745,7 +697,7 @@ mod tests {
         grid.rows[2].selected = 1;
         assert_eq!(
             "Upgrade react ^19.0.0, jest ^27.5.1\n",
-            without_ansi(&grid.render_success().unwrap())
+            without_ansi(&grid.render_success().to_ansi())
         );
     }
 
@@ -787,7 +739,7 @@ mod tests {
         grid.prepare();
         grid.filtering = true;
         grid.capacity = grid.capacity_for(20, 80);
-        let frame = grid.render().unwrap();
+        let frame = grid.render().to_ansi();
         assert!(frame.contains("(page 1/"), "{frame}");
         assert!(
             crate::height::rendered_height(&frame, 80) < 20,
@@ -798,7 +750,7 @@ mod tests {
         // Rows wider than the terminal wrap, and take two lines each.
         let narrow = grid.capacity_for(20, 10);
         grid.capacity = narrow;
-        let frame = grid.render().unwrap();
+        let frame = grid.render().to_ansi();
         assert!(crate::height::rendered_height(&frame, 10) < 20, "{frame}");
     }
 
@@ -815,7 +767,7 @@ mod tests {
             grid.handle_down();
         }
         assert_eq!(grid.page(), 1);
-        let rendered = without_ansi(&grid.render().unwrap()).to_string();
+        let rendered = without_ansi(&grid.render().to_ansi()).to_string();
         assert!(rendered.contains(" > 5"), "{rendered}");
         assert!(rendered.contains("(page 2/3)"), "{rendered}");
         grid.handle_page(1);
@@ -831,7 +783,7 @@ mod tests {
     fn redraw_does_not_drift_upward() {
         let (term, buf) = capture_term();
         let mut grid = packages();
-        grid.term = term;
+        let mut host = Host::new(term);
 
         let mut parser = Parser::new(40, 120, 0);
         parser.process(&b"\n".repeat(20));
@@ -839,7 +791,7 @@ mod tests {
         let mut cursor_rows = Vec::new();
         for i in 0..6 {
             let before = snapshot(&buf).len();
-            grid.redraw().unwrap();
+            host.draw(&mut grid).unwrap();
             replay(&mut parser, &snapshot(&buf)[before..]);
             cursor_rows.push(parser.screen().cursor_position().0);
             if i % 2 == 0 {

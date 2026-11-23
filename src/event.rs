@@ -18,11 +18,7 @@ pub(crate) enum Event {
 }
 
 impl EventReader {
-    pub(crate) fn new() -> io::Result<Self> {
-        Self::with_updates(None)
-    }
-
-    /// Also wake up when `updates` receives one, so it can be drawn
+    /// Wake up for keys and resizes, and when `updates` receives one, so it can be drawn
     /// without waiting for a key.
     pub(crate) fn with_updates(updates: Option<&crate::handle::Updates>) -> io::Result<Self> {
         #[cfg(not(unix))]
@@ -36,17 +32,6 @@ impl EventReader {
                     .transpose()?,
             )?,
         })
-    }
-
-    /// The next key, or `None` if the terminal was resized.
-    pub(crate) fn read_key(&mut self, term: &Term) -> io::Result<Option<Key>> {
-        loop {
-            match self.read(term)? {
-                Event::Key(key) => return Ok(Some(key)),
-                Event::Resize => return Ok(None),
-                Event::Update => {}
-            }
-        }
     }
 
     #[cfg(unix)]
