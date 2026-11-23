@@ -1,12 +1,10 @@
-use std::{
-    char,
-    io::{self, Write},
-};
+use std::{char, io};
 
 use console::{Key, Term};
-use termcolor::{Buffer, WriteColor};
 
-use crate::ctrlc;
+use crate::host::Host;
+use crate::prompt::{CliOptions, Outcome, Prompt};
+use crate::view::{Size, View};
 use crate::{Theme, theme};
 
 /// Trait for implementing autocompletion features for text inputs.
@@ -187,8 +185,6 @@ pub struct Input<'a> {
 
     // Internal state
     cursor: usize,
-    frame: crate::frame::Frame,
-    term: Term,
     err: Option<String>,
     suggestion: Option<String>,
     autocompleter: Box<dyn Autocomplete>,
@@ -196,20 +192,11 @@ pub struct Input<'a> {
     selected_suggestion_idx: Option<usize>,
     show_suggestions: bool,
     max_suggestions_display: usize,
-    input_line_offset: usize,
-    /// The (row, column) of the caret within the input row, which can
-    /// wrap onto several rows.
-    caret: (usize, usize),
-    /// Physical rows the input row wraps into.
-    input_rows: usize,
-    /// Rows between where `set_cursor` parked the cursor and the end of
-    /// the frame, so `reset_cursor_to_end` can walk back down. Recorded
-    /// rather than recomputed: by the time the cursor goes back down, the
-    /// next frame has been rendered and the layout fields describe it.
-    rows_below_caret: usize,
     suggestions_scroll_offset: usize,
     /// Text removed by the last kill command, for ctrl-y to put back.
     kill_buffer: String,
+    /// Whether the first suggestions have been asked for.
+    prepared: bool,
 }
 
 const CTRL_B: char = '\u{02}';
@@ -241,8 +228,6 @@ impl<'a> Input<'a> {
 
             // Internal state
             cursor: 0,
-            frame: Default::default(),
-            term: Term::stderr(),
             err: None,
             suggestion: None,
             autocompleter: Box::new(NoAutocompletion),
@@ -250,12 +235,9 @@ impl<'a> Input<'a> {
             selected_suggestion_idx: None,
             show_suggestions: false,
             max_suggestions_display: 5,
-            input_line_offset: 0,
-            caret: (0, 0),
-            input_rows: 1,
-            rows_below_caret: 0,
             suggestions_scroll_offset: 0,
             kill_buffer: String::new(),
+            prepared: false,
         }
     }
 
@@ -407,7 +389,7 @@ impl<'a> Input<'a> {
 
             crate::tty::write_prompt(&self.title, &self.description, prompt)?;
             self.input = crate::tty::read_line()?;
-            self.validate()?;
+            self.validate();
 
             if let Some(err) = self.err {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, err));
@@ -417,95 +399,39 @@ impl<'a> Input<'a> {
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err));
         }
 
-        let ctrlc_handle = ctrlc::show_cursor_after_ctrlc(&self.term)?;
-
-        self.term.hide_cursor()?;
-        self.update_suggestions()?;
-
-        loop {
-            let term = self.term.clone();
-            crate::synchronized_output::run(&term, || self.draw())?;
-
-            let key = self.term.read_key()?;
-            match key {
-                Key::Char(CTRL_U) => self.handle_ctrl_u()?,
-                Key::Char(CTRL_W) => self.handle_ctrl_w()?,
-                Key::Char(CTRL_K) => self.kill_to_end()?,
-                Key::Char(CTRL_Y) => self.yank()?,
-                Key::Char(CTRL_T) => self.transpose_chars()?,
-                Key::Char(CTRL_D) | Key::Del => self.delete_char()?,
-                Key::Char(CTRL_B) => self.handle_arrow_left()?,
-                Key::Char(CTRL_F) => self.handle_arrow_right()?,
-                Key::Char(CTRL_P) => self.handle_arrow_up()?,
-                Key::Char(CTRL_N) => self.handle_arrow_down()?,
-                // Any other control char has no binding; inserting it
-                // would put an invisible byte in the input.
-                Key::Char(c) if c.is_control() => {}
-                Key::Char(c) => self.handle_key(c)?,
-                // The terminal sends alt+<key> as escape followed by the key.
-                Key::UnknownEscSeq(ref seq) => match seq.as_slice() {
-                    ['b'] => self.cursor = self.word_start_before(self.cursor),
-                    ['f'] => self.cursor = self.word_end_after(self.cursor),
-                    ['d'] => self.kill_word_forward()?,
-                    ['\x7f'] | ['\x08'] => self.kill_word_backward()?,
-                    _ => {}
-                },
-                Key::Backspace => self.handle_backspace()?,
-                Key::ArrowLeft => self.handle_arrow_left()?,
-                Key::ArrowRight => self.handle_arrow_right()?,
-                Key::ArrowUp => self.handle_arrow_up()?,
-                Key::ArrowDown => self.handle_arrow_down()?,
-                Key::Home => self.handle_home()?,
-                Key::End => self.handle_end()?,
-                Key::Enter => {
-                    self.clear_err()?;
-                    self.validate()?;
-                    if self.err.is_none() {
-                        match parser.parse(&self.input) {
-                            Ok(value) => {
-                                self.reset_cursor_to_end()?;
-                                self.term.clear_to_end_of_screen()?;
-                                self.term.show_cursor()?;
-                                ctrlc_handle.close();
-                                self.handle_submit()?;
-                                return Ok(value);
-                            }
-                            Err(err) => self.err = Some(err),
-                        }
-                    }
-                }
-                Key::Tab => self.handle_tab()?,
-                Key::Escape => {
-                    self.clear()?;
-                    self.term.show_cursor()?;
-                    ctrlc_handle.close();
-                    return Err(io::Error::new(io::ErrorKind::Interrupted, "user cancelled"));
-                }
-                _ => {}
+        Host::new(Term::stderr()).run(&mut self, |input| match parser.parse(&input.input) {
+            Ok(value) => Some(value),
+            Err(err) => {
+                input.err = Some(err);
+                None
             }
-            if key != Key::Enter {
-                self.clear_err()?;
-            }
+        })
+    }
+
+    /// Ask for the first suggestions, before anything has been typed.
+    fn prepare(&mut self) {
+        if !self.prepared {
+            self.prepared = true;
+            self.update_suggestions();
         }
     }
 
-    fn handle_key(&mut self, c: char) -> io::Result<()> {
+    fn insert_char(&mut self, c: char) {
         let idx = self.get_char_idx(&self.input, self.cursor);
         self.input.insert(idx, c);
         self.cursor += 1;
-        self.update_suggestions()?;
-        Ok(())
+        self.update_suggestions();
     }
 
-    fn handle_ctrl_u(&mut self) -> io::Result<()> {
+    fn handle_ctrl_u(&mut self) {
         self.kill(0, self.cursor)
     }
 
-    fn handle_ctrl_w(&mut self) -> io::Result<()> {
+    fn handle_ctrl_w(&mut self) {
         // is masked, delete whole line to not reveal whitespace
         if self.password {
-            self.handle_ctrl_u()?;
-            return Ok(());
+            self.handle_ctrl_u();
+            return;
         }
         let idx = self.get_char_idx(&self.input, self.cursor);
         let slice = &self.input[0..idx];
@@ -526,9 +452,9 @@ impl<'a> Input<'a> {
 
     /// Remove the chars in `from..to` into the kill buffer, leaving the
     /// cursor where they were.
-    fn kill(&mut self, from: usize, to: usize) -> io::Result<()> {
+    fn kill(&mut self, from: usize, to: usize) {
         if from >= to {
-            return Ok(());
+            return;
         }
         let start = self.get_char_idx(&self.input, from);
         let end = self.get_char_idx(&self.input, to);
@@ -539,12 +465,12 @@ impl<'a> Input<'a> {
     }
 
     /// ctrl-k: kill from the cursor to the end of the line.
-    fn kill_to_end(&mut self) -> io::Result<()> {
+    fn kill_to_end(&mut self) {
         self.kill(self.cursor, self.input.chars().count())
     }
 
     /// alt-d: kill from the cursor to the end of the word.
-    fn kill_word_forward(&mut self) -> io::Result<()> {
+    fn kill_word_forward(&mut self) {
         if self.password {
             return self.kill_to_end();
         }
@@ -552,7 +478,7 @@ impl<'a> Input<'a> {
     }
 
     /// alt-backspace: kill from the start of the word to the cursor.
-    fn kill_word_backward(&mut self) -> io::Result<()> {
+    fn kill_word_backward(&mut self) {
         if self.password {
             return self.handle_ctrl_u();
         }
@@ -560,7 +486,7 @@ impl<'a> Input<'a> {
     }
 
     /// ctrl-y: insert the last killed text at the cursor.
-    fn yank(&mut self) -> io::Result<()> {
+    fn yank(&mut self) {
         let idx = self.get_char_idx(&self.input, self.cursor);
         self.input.insert_str(idx, &self.kill_buffer);
         self.cursor += self.kill_buffer.chars().count();
@@ -568,20 +494,19 @@ impl<'a> Input<'a> {
     }
 
     /// ctrl-d / delete: remove the char under the cursor.
-    fn delete_char(&mut self) -> io::Result<()> {
+    fn delete_char(&mut self) {
         if self.cursor < self.input.chars().count() {
             let idx = self.get_char_idx(&self.input, self.cursor);
             self.input.remove(idx);
-            self.update_suggestions()?;
+            self.update_suggestions();
         }
-        Ok(())
     }
 
     /// ctrl-t: swap the character before the cursor with the one under it,
     /// moving the cursor forward. At the end of the line, swap the last
     /// two instead. Combining marks (zero-width chars such as the accent
     /// in `a\u{301}`) stay with the character they're drawn on.
-    fn transpose_chars(&mut self) -> io::Result<()> {
+    fn transpose_chars(&mut self) {
         let mut clusters: Vec<String> = Vec::new();
         let mut buf = [0; 4];
         for c in self.input.chars() {
@@ -612,7 +537,7 @@ impl<'a> Input<'a> {
             })
             .count();
         if clusters.len() < 2 || before == 0 {
-            return Ok(());
+            return;
         }
         let at = before.min(clusters.len() - 1);
         clusters.swap(at - 1, at);
@@ -655,7 +580,7 @@ impl<'a> Input<'a> {
         i
     }
 
-    fn handle_backspace(&mut self) -> io::Result<()> {
+    fn handle_backspace(&mut self) {
         let chars_count = self.input.chars().count();
         if chars_count > 0 && self.cursor > 0 {
             let idx = self.get_char_idx(&self.input, self.cursor - 1);
@@ -664,25 +589,22 @@ impl<'a> Input<'a> {
         if self.cursor > 0 {
             self.cursor -= 1;
         }
-        self.update_suggestions()?;
-        Ok(())
+        self.update_suggestions();
     }
 
-    fn handle_arrow_left(&mut self) -> io::Result<()> {
+    fn handle_arrow_left(&mut self) {
         if self.cursor > 0 {
             self.cursor -= 1;
         }
-        Ok(())
     }
 
-    fn handle_arrow_right(&mut self) -> io::Result<()> {
+    fn handle_arrow_right(&mut self) {
         if self.cursor < self.input.chars().count() {
             self.cursor += 1;
         }
-        Ok(())
     }
 
-    fn handle_arrow_up(&mut self) -> io::Result<()> {
+    fn handle_arrow_up(&mut self) {
         if self.show_suggestions && !self.suggestions_list.is_empty() {
             self.selected_suggestion_idx = match self.selected_suggestion_idx {
                 Some(idx) if idx > 0 => Some(idx - 1),
@@ -691,10 +613,9 @@ impl<'a> Input<'a> {
             };
             self.update_scroll_offset();
         }
-        Ok(())
     }
 
-    fn handle_arrow_down(&mut self) -> io::Result<()> {
+    fn handle_arrow_down(&mut self) {
         if self.show_suggestions && !self.suggestions_list.is_empty() {
             self.selected_suggestion_idx = match self.selected_suggestion_idx {
                 Some(idx) if idx < self.suggestions_list.len() - 1 => Some(idx + 1),
@@ -703,7 +624,6 @@ impl<'a> Input<'a> {
             };
             self.update_scroll_offset();
         }
-        Ok(())
     }
 
     fn update_scroll_offset(&mut self) {
@@ -716,17 +636,16 @@ impl<'a> Input<'a> {
         }
     }
 
-    fn handle_home(&mut self) -> io::Result<()> {
+    fn handle_home(&mut self) {
         self.cursor = 0;
-        Ok(())
     }
 
-    fn handle_end(&mut self) -> io::Result<()> {
+    fn handle_end(&mut self) {
         self.cursor = self.input.chars().count();
-        Ok(())
     }
 
-    fn handle_tab(&mut self) -> io::Result<()> {
+    /// Whether there was anything to complete.
+    fn handle_tab(&mut self) -> bool {
         let highlighted = self
             .selected_suggestion_idx
             .and_then(|idx| self.suggestions_list.get(idx))
@@ -734,100 +653,60 @@ impl<'a> Input<'a> {
 
         match self.autocompleter.get_completion(&self.input, highlighted) {
             Ok(Some(completion)) => {
+                let changed = self.input != completion;
                 self.input = completion;
                 self.cursor = self.input.chars().count();
                 self.show_suggestions = false;
                 self.selected_suggestion_idx = None;
                 self.suggestions_scroll_offset = 0;
-                self.update_suggestions()?;
+                self.update_suggestions();
+                changed
             }
             Ok(None) => {
                 if let Some(suggestion) = &self.suggestion {
                     self.input.push_str(suggestion);
                     self.cursor = self.input.chars().count();
-                    self.update_suggestions()?;
+                    self.update_suggestions();
+                    true
+                } else {
+                    false
                 }
             }
-            Err(_) => {}
+            Err(_) => false,
         }
-        Ok(())
     }
 
-    fn handle_submit(mut self) -> io::Result<String> {
-        let term = self.term.clone();
-        crate::synchronized_output::run(&term, || {
-            self.clear()?;
-            let output = self.render_success()?;
-            self.term.write_all(output.as_bytes())
-        })?;
-        Ok(self.input)
-    }
+    fn render(&self) -> View {
+        let mut out = View::default();
 
-    fn render(&mut self) -> io::Result<String> {
-        let mut out = Buffer::ansi();
-
-        out.set_color(&self.theme.title)?;
+        out.set_color(&self.theme.title);
         match self.inline {
             true => {
-                write!(out, "{}", self.title)?;
+                write!(out, "{}", self.title);
             }
             false => {
-                writeln!(out, "{}", self.title)?;
+                writeln!(out, "{}", self.title);
             }
         }
 
-        out.set_color(&self.theme.description)?;
+        out.set_color(&self.theme.description);
         if !self.description.is_empty() {
             match self.inline {
-                true => write!(out, " {}", self.description)?,
+                true => write!(out, " {}", self.description),
                 false => {
-                    writeln!(out, "{}", self.description)?;
+                    writeln!(out, "{}", self.description);
                 }
             }
         }
 
-        out.set_color(&self.theme.input_prompt)?;
+        out.set_color(&self.theme.input_prompt);
         if !self.prompt.is_empty() {
-            write!(out, "{}", self.prompt)?;
+            write!(out, "{}", self.prompt);
         }
-        out.reset()?;
+        out.reset();
 
-        // Rows above the input row. Everything written so far is the
-        // header plus the prompt, and the prompt shares the input's row —
-        // which is exactly what `rendered_height` excludes, so it gives
-        // the header's height directly. Counting rows rather than lines
-        // matters because `self.height` is in rows: subtracting a logical
-        // line count from it would put the caret on the wrong row as soon
-        // as a title or description wrapped. Inline mode writes no
-        // newline at all and correctly comes out as 0.
-        let width = self.term.size().1 as usize;
-        let header = std::str::from_utf8(out.as_slice()).unwrap_or_default();
-        self.input_line_offset = crate::height::rendered_height(header, width);
-        let row_start = header.rfind('\n').map_or(0, |i| i + 1);
-        let prefix = header[row_start..].to_string();
-
-        let input = self.render_input(&mut out)?;
-        // Lay the row out as the terminal will: an inline title, the
-        // prompt and the input all share it, wide characters take two
-        // columns, and one that doesn't fit at the edge moves to the next
-        // row. The caret is where the char under it starts — or where the
-        // cursor block after the input starts. A zero-width char adds no
-        // columns, so the caret sits right where it would print.
-        let written = std::str::from_utf8(out.as_slice()).unwrap_or_default();
-        self.input_rows = crate::height::rows_for(&written[row_start..], width);
-        let caret_idx = self.get_char_idx(&input, self.cursor);
-        let under_caret = input[caret_idx..].chars().next().unwrap_or(' ');
-        let through_caret = format!("{prefix}{}{under_caret}", &input[..caret_idx]);
-        let (row, end) = crate::height::cursor_after(&through_caret, width);
-        let start = end.saturating_sub(console::measure_text_width(&under_caret.to_string()));
-        self.caret = if row < self.input_rows {
-            (row, start)
-        } else {
-            // Nothing is drawn after a caret at the very edge of the last
-            // row, so the terminal never wraps onto the row it'd be on.
-            (self.input_rows - 1, width.saturating_sub(1))
-        };
-        writeln!(out)?;
+        self.render_input(&mut out);
+        writeln!(out);
 
         if self.show_suggestions && !self.suggestions_list.is_empty() {
             let end_idx = (self.suggestions_scroll_offset + self.max_suggestions_display)
@@ -839,74 +718,75 @@ impl<'a> Input<'a> {
             {
                 let actual_idx = i + self.suggestions_scroll_offset;
                 if Some(actual_idx) == self.selected_suggestion_idx {
-                    out.set_color(&self.theme.selected_option)?;
-                    write!(out, " → {}", suggestion)?;
+                    out.set_color(&self.theme.selected_option);
+                    write!(out, " → {}", suggestion);
                 } else {
-                    out.set_color(&self.theme.unselected_option)?;
-                    write!(out, "   {}", suggestion)?;
+                    out.set_color(&self.theme.unselected_option);
+                    write!(out, "   {}", suggestion);
                 }
-                writeln!(out)?;
+                writeln!(out);
             }
 
             if self.suggestions_list.len() > self.max_suggestions_display {
-                out.set_color(&self.theme.description)?;
+                out.set_color(&self.theme.description);
                 let remaining = self.suggestions_list.len() - end_idx;
                 if remaining > 0 {
-                    writeln!(out, "   ↓ {} more", remaining)?;
+                    writeln!(out, "   ↓ {} more", remaining);
                 } else if self.suggestions_scroll_offset > 0 {
-                    writeln!(out, "   ↑ scroll for more")?;
+                    writeln!(out, "   ↑ scroll for more");
                 }
             }
-            out.reset()?;
+            out.reset();
         }
 
         if let Some(err) = &self.err {
-            out.set_color(&self.theme.error_indicator)?;
-            writeln!(out)?;
-            writeln!(out)?;
-            write!(out, "✗ {err}")?;
-            out.reset()?;
+            out.set_color(&self.theme.error_indicator);
+            writeln!(out);
+            writeln!(out);
+            write!(out, "✗ {err}");
+            out.reset();
         }
 
-        out.reset()?;
-
-        Ok(std::str::from_utf8(out.as_slice()).unwrap().to_string())
+        out.reset();
+        out
     }
 
-    fn render_input(&mut self, out: &mut Buffer) -> io::Result<String> {
+    fn render_input(&self, out: &mut View) {
         let input = match self.password {
             true => self.input.chars().map(|_| '*').collect::<String>(),
             false => self.input.to_string(),
         };
 
         if !self.placeholder.is_empty() && self.input.is_empty() {
+            out.mark_caret();
             out.set_color(
                 &self
                     .theme
                     .real_cursor_color(Some(&self.theme.input_placeholder)),
-            )?;
+            );
             let split = first_char_len(&self.placeholder);
-            write!(out, "{}", &self.placeholder[..split])?;
+            write!(out, "{}", &self.placeholder[..split]);
             if self.placeholder.len() > split {
-                out.set_color(&self.theme.input_placeholder)?;
-                write!(out, "{}", &self.placeholder[split..])?;
-                out.reset()?;
+                out.set_color(&self.theme.input_placeholder);
+                write!(out, "{}", &self.placeholder[split..]);
+                out.reset();
             }
-            return Ok(input);
+            return;
         }
 
         let cursor_idx = self.get_char_idx(&input, self.cursor);
-        write!(out, "{}", &input[..cursor_idx])?;
+        write!(out, "{}", &input[..cursor_idx]);
+        out.mark_caret();
 
         let after_cursor = cursor_idx + first_char_len(&input[cursor_idx..]);
         if cursor_idx < input.len() {
-            out.set_color(&self.theme.real_cursor_color(None))?;
-            write!(out, "{}", &input[cursor_idx..after_cursor])?;
-            out.reset()?;
+            out.set_color(&self.theme.real_cursor_color(None));
+            write!(out, "{}", &input[cursor_idx..after_cursor]);
+            out.reset();
         }
         if after_cursor < input.len() {
-            out.reset()?;
-            write!(out, "{}", &input[after_cursor..])?;
+            out.reset();
+            write!(out, "{}", &input[after_cursor..]);
         }
 
         if let Some(suggestion) = &self.suggestion {
@@ -916,33 +796,31 @@ impl<'a> Input<'a> {
                         &self
                             .theme
                             .real_cursor_color(Some(&self.theme.input_placeholder)),
-                    )?;
+                    );
                     let split = first_char_len(suggestion);
-                    write!(out, "{}", &suggestion[..split])?;
+                    write!(out, "{}", &suggestion[..split]);
                     if suggestion.len() > split {
-                        out.set_color(&self.theme.input_placeholder)?;
-                        write!(out, "{}", &suggestion[split..])?;
+                        out.set_color(&self.theme.input_placeholder);
+                        write!(out, "{}", &suggestion[split..]);
                     }
                 } else {
-                    out.set_color(&self.theme.input_placeholder)?;
-                    write!(out, "{suggestion}")?;
+                    out.set_color(&self.theme.input_placeholder);
+                    write!(out, "{suggestion}");
                 }
-                out.reset()?;
+                out.reset();
             }
         } else if cursor_idx >= input.len() {
-            out.set_color(&self.theme.real_cursor_color(None))?;
-            write!(out, " ")?;
-            out.reset()?;
+            out.set_color(&self.theme.real_cursor_color(None));
+            write!(out, " ");
+            out.reset();
         }
-
-        Ok(input)
     }
 
-    fn render_success(&mut self) -> io::Result<String> {
-        let mut out = Buffer::ansi();
-        out.set_color(&self.theme.title)?;
-        write!(out, "{}", self.title)?;
-        out.set_color(&self.theme.selected_option)?;
+    fn render_success(&self) -> View {
+        let mut out = View::default();
+        out.set_color(&self.theme.title);
+        write!(out, "{}", self.title);
+        out.set_color(&self.theme.selected_option);
         writeln!(
             out,
             " {}",
@@ -953,12 +831,12 @@ impl<'a> Input<'a> {
             } else {
                 self.input.to_string()
             }
-        )?;
-        out.reset()?;
-        Ok(std::str::from_utf8(out.as_slice()).unwrap().to_string())
+        );
+        out.reset();
+        out
     }
 
-    fn update_suggestions(&mut self) -> io::Result<()> {
+    fn update_suggestions(&mut self) {
         match self.autocompleter.get_suggestions(&self.input) {
             Ok(suggestions) => {
                 if !suggestions.is_empty() {
@@ -987,14 +865,13 @@ impl<'a> Input<'a> {
             }
         }
 
-        self.suggest()?;
-        Ok(())
+        self.suggest();
     }
 
-    fn suggest(&mut self) -> io::Result<()> {
+    fn suggest(&mut self) {
         if self.input.is_empty() {
             self.suggestion = None;
-            return Ok(());
+            return;
         }
         if let Some(suggestions) = &self.suggestions {
             let input_lower = self.input.to_lowercase();
@@ -1016,12 +893,10 @@ impl<'a> Input<'a> {
                     (!suggestion.is_empty()).then_some(suggestion)
                 });
         }
-        Ok(())
     }
 
-    fn validate(&mut self) -> io::Result<()> {
+    fn validate(&mut self) {
         self.err = self.validation.check(&self.input).err();
-        Ok(())
     }
 
     fn get_char_idx(&self, input: &str, cursor: usize) -> usize {
@@ -1030,70 +905,6 @@ impl<'a> Input<'a> {
             .nth(cursor)
             .map(|(i, _)| i)
             .unwrap_or(input.len())
-    }
-
-    /// Park the terminal cursor on the caret. When the input row wraps,
-    /// the caret can be on any of its rows: cursor movement stops at the
-    /// right edge rather than wrapping, so the row has to be picked
-    /// explicitly and only the remainder moved across.
-    fn set_cursor(&mut self) -> io::Result<()> {
-        let (row, col) = self.caret;
-        let rows_up = self.frame.height(&self.term) - self.input_line_offset - row;
-        self.rows_below_caret = rows_up;
-        if rows_up > 0 {
-            self.term.move_cursor_up(rows_up)?;
-        }
-        self.term.move_cursor_left(usize::MAX)?;
-        if col > 0 {
-            self.term.move_cursor_right(col)?;
-        }
-        Ok(())
-    }
-
-    fn reset_cursor_to_end(&mut self) -> io::Result<()> {
-        if self.rows_below_caret > 0 {
-            self.term.move_cursor_down(self.rows_below_caret)?;
-        }
-        self.rows_below_caret = 0;
-        Ok(())
-    }
-
-    /// Draw a fresh frame over the previous one and park the cursor on the
-    /// caret. A frame identical to the one on screen leaves everything,
-    /// cursor included, where it is.
-    fn draw(&mut self) -> io::Result<()> {
-        let output = self.render()?;
-        if self.frame.is_current(&self.term, &output) {
-            return Ok(());
-        }
-        if self.frame.resized(&self.term) {
-            // The caret-to-end distance was measured at the old width, and
-            // the terminal has reflowed the rows it counted, so it can't be
-            // used to find the frame. Start over from a clear screen, as
-            // `Select` does on a resize.
-            self.term.clear_screen()?;
-            self.frame.forget();
-            self.rows_below_caret = 0;
-        } else {
-            self.reset_cursor_to_end()?;
-        }
-        self.frame.update(&self.term, output)?;
-        self.set_cursor()
-    }
-
-    fn clear_err(&mut self) -> io::Result<()> {
-        if self.err.is_some() {
-            self.err = None;
-        }
-        Ok(())
-    }
-
-    fn clear(&mut self) -> io::Result<()> {
-        if !self.frame.is_empty() {
-            self.reset_cursor_to_end()?;
-            self.frame.clear(&self.term)?;
-        }
-        Ok(())
     }
 }
 
@@ -1242,6 +1053,73 @@ impl InputValidator for fn(&str) -> Result<(), &str> {
     }
 }
 
+impl Prompt for Input<'_> {
+    fn on_key(&mut self, key: Key) -> Outcome {
+        self.prepare();
+        self.err = None;
+        match key {
+            Key::Char(CTRL_U) => self.handle_ctrl_u(),
+            Key::Char(CTRL_W) => self.handle_ctrl_w(),
+            Key::Char(CTRL_K) => self.kill_to_end(),
+            Key::Char(CTRL_Y) => self.yank(),
+            Key::Char(CTRL_T) => self.transpose_chars(),
+            Key::Char(CTRL_D) | Key::Del => self.delete_char(),
+            Key::Char(CTRL_B) => self.handle_arrow_left(),
+            Key::Char(CTRL_F) => self.handle_arrow_right(),
+            Key::Char(CTRL_P) | Key::ArrowUp if self.show_suggestions => self.handle_arrow_up(),
+            Key::Char(CTRL_N) | Key::ArrowDown if self.show_suggestions => self.handle_arrow_down(),
+            // Any other control char has no binding; inserting it
+            // would put an invisible byte in the input.
+            Key::Char(c) if c.is_control() => return Outcome::Ignored,
+            Key::Char(c) => self.insert_char(c),
+            // The terminal sends alt+<key> as escape followed by the key.
+            Key::UnknownEscSeq(ref seq) => match seq.as_slice() {
+                ['b'] => self.cursor = self.word_start_before(self.cursor),
+                ['f'] => self.cursor = self.word_end_after(self.cursor),
+                ['d'] => self.kill_word_forward(),
+                ['\x7f'] | ['\x08'] => self.kill_word_backward(),
+                _ => return Outcome::Ignored,
+            },
+            Key::Backspace => self.handle_backspace(),
+            Key::ArrowLeft => self.handle_arrow_left(),
+            Key::ArrowRight => self.handle_arrow_right(),
+            Key::Home => self.handle_home(),
+            Key::End => self.handle_end(),
+            Key::Enter => {
+                self.validate();
+                if self.err.is_none() {
+                    return Outcome::Submit;
+                }
+            }
+            // A tab with nothing to complete is left to the host.
+            Key::Tab => {
+                if !self.handle_tab() {
+                    return Outcome::Ignored;
+                }
+            }
+            Key::Escape => return Outcome::Cancel,
+            _ => return Outcome::Ignored,
+        }
+        Outcome::Handled
+    }
+
+    fn view(&mut self, _size: Size) -> View {
+        self.prepare();
+        self.render()
+    }
+
+    fn success(&mut self) -> View {
+        self.render_success()
+    }
+
+    fn cli(&self) -> CliOptions {
+        CliOptions {
+            park_cursor: true,
+            ..Default::default()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::test::without_ansi;
@@ -1259,60 +1137,60 @@ mod tests {
 
     #[test]
     fn test_render() {
-        let mut input = Input::new("Title")
+        let input = Input::new("Title")
             .description("Description")
             .prompt("$ ")
             .placeholder("Placeholder");
 
         assert_eq!(
             "Title\nDescription\n$ Placeholder\n",
-            without_ansi(input.render().unwrap().as_str())
+            without_ansi(input.render().to_ansi().as_str())
         );
     }
 
     #[test]
     fn test_render_title() {
-        let mut input = Input::new("Title");
+        let input = Input::new("Title");
 
         assert_eq!(
             "Title\n>  \n",
-            without_ansi(input.render().unwrap().as_str())
+            without_ansi(input.render().to_ansi().as_str())
         );
     }
 
     #[test]
     fn test_render_description() {
-        let mut input = Input::new("Title").description("Description");
+        let input = Input::new("Title").description("Description");
 
         assert_eq!(
             "Title\nDescription\n>  \n",
-            without_ansi(input.render().unwrap().as_str())
+            without_ansi(input.render().to_ansi().as_str())
         );
     }
 
     #[test]
     fn test_render_prompt() {
-        let mut input = Input::new("Title").prompt("$ ");
+        let input = Input::new("Title").prompt("$ ");
 
         assert_eq!(
             "Title\n$  \n",
-            without_ansi(input.render().unwrap().as_str())
+            without_ansi(input.render().to_ansi().as_str())
         );
     }
 
     #[test]
     fn test_render_placeholder() {
-        let mut input = Input::new("Title").placeholder("Placeholder");
+        let input = Input::new("Title").placeholder("Placeholder");
 
         assert_eq!(
             "Title\n> Placeholder\n",
-            without_ansi(input.render().unwrap().as_str())
+            without_ansi(input.render().to_ansi().as_str())
         );
     }
 
     #[test]
     fn test_render_inline() {
-        let mut input = Input::new("Title?")
+        let input = Input::new("Title?")
             .description("Description.")
             .prompt("Prompt:")
             .placeholder("Placeholder")
@@ -1320,7 +1198,7 @@ mod tests {
 
         assert_eq!(
             "Title? Description.Prompt:Placeholder\n",
-            without_ansi(input.render().unwrap().as_str())
+            without_ansi(input.render().to_ansi().as_str())
         );
     }
 
@@ -1331,17 +1209,17 @@ mod tests {
             .validation(NON_EMPTY);
 
         input.input = "".to_string();
-        input.validate().unwrap();
+        input.validate();
         assert_eq!(
             "Title\nDescription\n>  \n\n\n✗ Name cannot be empty",
-            without_ansi(input.render().unwrap().as_str())
+            without_ansi(input.render().to_ansi().as_str())
         );
 
         input.input = "non empty".to_string();
-        input.validate().unwrap();
+        input.validate();
         assert_eq!(
             "Title\nDescription\n> non empty\n",
-            without_ansi(input.render().unwrap().as_str())
+            without_ansi(input.render().to_ansi().as_str())
         );
     }
 
@@ -1353,17 +1231,17 @@ mod tests {
             .validation(NON_EMPTY);
 
         input.input = "".to_string();
-        input.validate().unwrap();
+        input.validate();
         assert_eq!(
             "Title? Description.>  \n\n\n✗ Name cannot be empty",
-            without_ansi(input.render().unwrap().as_str())
+            without_ansi(input.render().to_ansi().as_str())
         );
 
         input.input = "non empty".to_string();
-        input.validate().unwrap();
+        input.validate();
         assert_eq!(
             "Title? Description.> non empty\n",
-            without_ansi(input.render().unwrap().as_str())
+            without_ansi(input.render().to_ansi().as_str())
         );
     }
 
@@ -1373,7 +1251,7 @@ mod tests {
         input.input = "1234".to_string();
         assert_eq!(
             "PIN ****\n",
-            without_ansi(input.render_success().unwrap().as_str())
+            without_ansi(input.render_success().to_ansi().as_str())
         );
     }
 
@@ -1383,7 +1261,7 @@ mod tests {
         input.input = "".to_string();
         assert_eq!(
             "PIN \n",
-            without_ansi(input.render_success().unwrap().as_str())
+            without_ansi(input.render_success().to_ansi().as_str())
         );
     }
 
@@ -1393,31 +1271,28 @@ mod tests {
         input.input = "short".to_string();
         assert_eq!(
             "Password ************\n",
-            without_ansi(input.render_success().unwrap().as_str())
+            without_ansi(input.render_success().to_ansi().as_str())
         );
     }
 
-    /// `input_line_offset` is subtracted from `self.height`, which counts
-    /// physical rows — so it has to count rows too. A title that wraps
+    /// The caret is on a physical row. A title that wraps
     /// occupies two of them, and counting it as one logical line would
     /// put the caret a row above where the input actually is.
     #[test]
-    fn input_line_offset_counts_rows_not_lines() {
-        let mut input = Input::new("t".repeat(200)).description("d");
-        input.render().unwrap();
-        let width = input.term.size().1 as usize;
+    fn the_caret_counts_rows_not_lines() {
+        let width = 80;
+        let input = Input::new("t".repeat(200)).description("d");
         let title_rows = 200_usize.div_ceil(width);
-        assert!(title_rows > 1, "test needs a title wider than the terminal");
-        assert_eq!(input.input_line_offset, title_rows + 1);
+        let (row, _) = input.render().layout(width).caret.unwrap();
+        assert_eq!(row, title_rows + 1);
     }
 
     /// Inline mode writes no newline before the input, so nothing sits
     /// above it.
     #[test]
     fn inline_input_has_no_rows_above_it() {
-        let mut input = Input::new("Name").inline(true);
-        input.render().unwrap();
-        assert_eq!(input.input_line_offset, 0);
+        let input = Input::new("Name").inline(true);
+        assert_eq!(input.render().layout(80).caret.unwrap().0, 0);
     }
 
     /// The cursor highlight used to slice one byte off the input, which
@@ -1425,10 +1300,10 @@ mod tests {
     #[test]
     fn renders_multibyte_char_under_the_caret() {
         let mut input = Input::new("Name").placeholder("éé");
-        input.render().unwrap();
+        input.render().to_ansi();
         input.input = "日本語".to_string();
         input.cursor = 1;
-        let rendered = input.render().unwrap();
+        let rendered = input.render().to_ansi();
         assert!(without_ansi(&rendered).contains("> 日本語"));
     }
 
@@ -1436,22 +1311,22 @@ mod tests {
     fn multibyte_char_suggestion() {
         let mut input = Input::new("Language").suggestions(&["日本語", "日本語（会話）"]);
         input.input = "日本".to_string();
-        input.suggest().unwrap();
+        input.suggest();
         assert_eq!(input.suggestion.as_deref(), Some("語"));
 
         let mut input = Input::new("Unit").suggestions(&["\u{212a}elvin"]);
         input.input = "k".to_string();
-        input.suggest().unwrap();
+        input.suggest();
         assert_eq!(input.suggestion.as_deref(), Some("elvin"));
 
         let mut input = Input::new("City").suggestions(&["İstanbul"]);
         input.input = "i\u{307}".to_string();
-        input.suggest().unwrap();
+        input.suggest();
         assert_eq!(input.suggestion.as_deref(), Some("stanbul"));
 
         let mut input = Input::new("Greek").suggestions(&["ΟΣΑ"]);
         input.input = "οσ".to_string();
-        input.suggest().unwrap();
+        input.suggest();
         assert_eq!(input.suggestion.as_deref(), Some("Α"));
     }
 
@@ -1459,16 +1334,16 @@ mod tests {
     fn ctrl_n_and_ctrl_p_navigate_suggestions() {
         let mut input = Input::new("Select")
             .autocomplete_fn(|_| Ok(vec!["apple".into(), "banana".into(), "cherry".into()]));
-        input.update_suggestions().unwrap();
+        input.update_suggestions();
         assert_eq!(input.selected_suggestion_idx, Some(0));
 
-        input.handle_arrow_down().unwrap();
+        input.handle_arrow_down();
         assert_eq!(input.selected_suggestion_idx, Some(1));
 
-        input.handle_arrow_down().unwrap();
+        input.handle_arrow_down();
         assert_eq!(input.selected_suggestion_idx, Some(2));
 
-        input.handle_arrow_up().unwrap();
+        input.handle_arrow_up();
         assert_eq!(input.selected_suggestion_idx, Some(1));
     }
 
@@ -1479,8 +1354,7 @@ mod tests {
         let mut input = Input::new("Name");
         input.input = "\u{200b}abc".to_string();
         input.cursor = 0;
-        input.render().unwrap();
-        assert_eq!(input.caret, (0, "> ".len()));
+        assert_eq!(input.render().layout(80).caret, Some((1, "> ".len())));
     }
 
     #[test]
@@ -1488,8 +1362,7 @@ mod tests {
         let mut input = Input::new("Name");
         input.input = "日本語".to_string();
         input.cursor = 2;
-        input.render().unwrap();
-        assert_eq!(input.caret, (0, "> ".len() + 4));
+        assert_eq!(input.render().layout(80).caret, Some((1, "> ".len() + 4)));
     }
 
     /// A wide char under the caret that doesn't fit at the end of a row is
@@ -1500,13 +1373,13 @@ mod tests {
     fn caret_follows_a_wide_char_wrapped_at_the_edge() {
         let (term, buf) = capture_term();
         let mut input = Input::new("Name");
-        input.term = term;
-        let width = input.term.size().1 as usize;
+        let mut host = Host::new(term);
+        let width = host.term.size().1 as usize;
         // "> " plus enough `x` to leave one column before the edge.
         input.input = format!("{}日本", "x".repeat(width - 3));
         input.cursor = width - 3;
-        input.draw().unwrap();
-        assert_eq!(input.caret, (1, 0));
+        host.draw(&mut input).unwrap();
+        assert_eq!(input.render().layout(width).caret, Some((2, 0)));
 
         let mut parser = Parser::new(24, width as u16, 0);
         replay(&mut parser, &snapshot(&buf));
@@ -1523,14 +1396,14 @@ mod tests {
     fn a_wrapped_input_row_keeps_the_caret_and_redraws_cleanly() {
         let (term, buf) = capture_term();
         let mut input = Input::new("Command").description("run what?");
-        input.term = term;
-        let width = input.term.size().1 as usize;
+        let mut host = Host::new(term);
+        let width = host.term.size().1 as usize;
         input.input = "x".repeat(width + 10);
         input.cursor = input.input.chars().count();
 
         for _ in 0..3 {
-            input.draw().unwrap();
-            input.handle_arrow_left().unwrap();
+            host.draw(&mut input).unwrap();
+            input.handle_arrow_left();
         }
 
         let mut parser = Parser::new(24, width as u16, 0);
@@ -1555,31 +1428,31 @@ mod tests {
     fn incremental_redraws_match_a_full_redraw() {
         let (term, buf) = capture_term();
         let mut input = Input::new("Command").description("run what?");
-        input.term = term;
-        let width = input.term.size().1;
+        let mut host = Host::new(term);
+        let width = host.term.size().1;
         input.input = "x".repeat(width as usize - 3);
         input.cursor = input.input.chars().count();
 
-        input.draw().unwrap();
+        host.draw(&mut input).unwrap();
         for c in "yyyy".chars() {
-            input.handle_key(c).unwrap();
-            input.draw().unwrap();
+            input.insert_char(c);
+            host.draw(&mut input).unwrap();
         }
-        input.handle_arrow_left().unwrap();
-        input.draw().unwrap();
-        input.handle_backspace().unwrap();
-        input.draw().unwrap();
+        input.handle_arrow_left();
+        host.draw(&mut input).unwrap();
+        input.handle_backspace();
+        host.draw(&mut input).unwrap();
         // A no-op key: the frame doesn't change and nothing is written.
         let before = snapshot(&buf).len();
-        input.draw().unwrap();
+        host.draw(&mut input).unwrap();
         assert_eq!(snapshot(&buf).len(), before);
 
         let (fresh_term, fresh_buf) = capture_term();
         let mut fresh = Input::new("Command").description("run what?");
         fresh.input = input.input.clone();
         fresh.cursor = input.cursor;
-        fresh.term = fresh_term;
-        fresh.draw().unwrap();
+        let mut fresh_host = Host::new(fresh_term);
+        fresh_host.draw(&mut fresh).unwrap();
 
         let mut patched = Parser::new(24, width, 0);
         replay(&mut patched, &snapshot(&buf));
@@ -1600,15 +1473,15 @@ mod tests {
     fn a_resize_redraws_from_a_clear_screen() {
         let (term, buf) = capture_term();
         let mut input = Input::new("Command").description("run what?");
-        input.term = term;
-        let width = input.term.size().1 as usize;
+        let mut host = Host::new(term);
+        let width = host.term.size().1 as usize;
         input.input = "x".repeat(width + 10);
         input.cursor = 0;
-        input.draw().unwrap();
+        host.draw(&mut input).unwrap();
         let before = snapshot(&buf).len();
 
-        input.frame.set_width(width + 20);
-        input.draw().unwrap();
+        host.frame.set_width(width + 20);
+        host.draw(&mut input).unwrap();
         let redraw = String::from_utf8_lossy(&snapshot(&buf)[before..]).to_string();
         assert!(
             redraw.contains("\x1b[2J"),
@@ -1639,20 +1512,20 @@ mod tests {
     #[test]
     fn ctrl_k_kills_to_end_and_ctrl_y_yanks_it_back() {
         let mut input = editing("hello world", 5);
-        input.kill_to_end().unwrap();
+        input.kill_to_end();
         assert_eq!((input.input.as_str(), input.cursor), ("hello", 5));
-        input.handle_home().unwrap();
-        input.yank().unwrap();
+        input.handle_home();
+        input.yank();
         assert_eq!((input.input.as_str(), input.cursor), (" worldhello", 6));
     }
 
     #[test]
     fn ctrl_u_and_ctrl_w_fill_the_kill_buffer() {
         let mut input = editing("one two three", 7);
-        input.handle_ctrl_w().unwrap();
+        input.handle_ctrl_w();
         assert_eq!((input.input.as_str(), input.cursor), ("one  three", 4));
         assert_eq!(input.kill_buffer, "two");
-        input.handle_ctrl_u().unwrap();
+        input.handle_ctrl_u();
         assert_eq!((input.input.as_str(), input.cursor), (" three", 0));
         assert_eq!(input.kill_buffer, "one ");
     }
@@ -1662,7 +1535,7 @@ mod tests {
     #[test]
     fn ctrl_w_keeps_the_cursor_in_chars_for_wide_text() {
         let mut input = editing("ab 日本語", 6);
-        input.handle_ctrl_w().unwrap();
+        input.handle_ctrl_w();
         assert_eq!((input.input.as_str(), input.cursor), ("ab ", 3));
     }
 
@@ -1680,10 +1553,10 @@ mod tests {
     #[test]
     fn alt_d_and_alt_backspace_kill_words() {
         let mut input = editing("foo bar baz", 4);
-        input.kill_word_forward().unwrap();
+        input.kill_word_forward();
         assert_eq!((input.input.as_str(), input.cursor), ("foo  baz", 4));
         let mut input = editing("foo bar baz", 7);
-        input.kill_word_backward().unwrap();
+        input.kill_word_backward();
         assert_eq!((input.input.as_str(), input.cursor), ("foo  baz", 4));
     }
 
@@ -1692,28 +1565,28 @@ mod tests {
         let mut input = editing("hunter 2", 8);
         input.password = true;
         assert_eq!(input.word_start_before(8), 0);
-        input.kill_word_backward().unwrap();
+        input.kill_word_backward();
         assert_eq!(input.input, "");
     }
 
     #[test]
     fn ctrl_d_deletes_under_the_cursor() {
         let mut input = editing("abc", 1);
-        input.delete_char().unwrap();
+        input.delete_char();
         assert_eq!((input.input.as_str(), input.cursor), ("ac", 1));
         let mut input = editing("abc", 3);
-        input.delete_char().unwrap();
+        input.delete_char();
         assert_eq!(input.input, "abc");
     }
 
     #[test]
     fn ctrl_t_transposes() {
         let mut input = editing("abcd", 2);
-        input.transpose_chars().unwrap();
+        input.transpose_chars();
         assert_eq!((input.input.as_str(), input.cursor), ("acbd", 3));
         // At the end of the line, the last two chars swap.
         let mut input = editing("abcd", 4);
-        input.transpose_chars().unwrap();
+        input.transpose_chars();
         assert_eq!((input.input.as_str(), input.cursor), ("abdc", 4));
     }
 
@@ -1722,10 +1595,10 @@ mod tests {
     #[test]
     fn ctrl_t_keeps_combining_marks_with_their_letter() {
         let mut input = editing("a\u{301}b", 2);
-        input.transpose_chars().unwrap();
+        input.transpose_chars();
         assert_eq!((input.input.as_str(), input.cursor), ("ba\u{301}", 3));
         let mut input = editing("xa\u{301}", 3);
-        input.transpose_chars().unwrap();
+        input.transpose_chars();
         assert_eq!(input.input, "a\u{301}x");
     }
 
@@ -1734,13 +1607,13 @@ mod tests {
     fn ctrl_t_keeps_joined_emoji_together() {
         let coder = "\u{1f469}\u{200d}\u{1f4bb}";
         let mut input = editing(&format!("{coder}x"), 3);
-        input.transpose_chars().unwrap();
+        input.transpose_chars();
         assert_eq!(input.input, format!("x{coder}"));
         assert_eq!(input.cursor, 4);
         // ♀ from the Miscellaneous Symbols block joins too.
         let runner = "\u{1f3c3}\u{200d}\u{2640}\u{fe0f}";
         let mut input = editing(&format!("x{runner}"), 5);
-        input.transpose_chars().unwrap();
+        input.transpose_chars();
         assert_eq!(input.input, format!("{runner}x"));
     }
 
@@ -1749,7 +1622,7 @@ mod tests {
     #[test]
     fn ctrl_t_does_not_join_letters_across_a_joiner() {
         let mut input = editing("xa\u{200d}b", 4);
-        input.transpose_chars().unwrap();
+        input.transpose_chars();
         assert_eq!(input.input, "xba\u{200d}");
     }
 }
