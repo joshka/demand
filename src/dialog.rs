@@ -176,6 +176,7 @@ impl<'a> Dialog<'a> {
 
         writeln!(out, "\n");
 
+        out.mark_focus();
         for (i, button) in self.buttons.iter().enumerate() {
             write!(out, " ");
             if self.selected_button_idx == i {

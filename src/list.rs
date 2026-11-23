@@ -251,6 +251,7 @@ impl<'a> List<'a> {
             write!(out, "/");
             out.reset();
             write!(out, "{}", self.filter);
+            out.mark_caret();
             out.set_color(&self.theme.real_cursor_color(None));
             writeln!(out, " ");
         } else if !self.filter.is_empty() {

@@ -93,6 +93,8 @@ pub struct Spinner<'a> {
     pub theme: &'a Theme,
 
     term: Term,
+    #[cfg(feature = "ratatui")]
+    started: std::time::Instant,
     frame: usize,
     height: usize,
 }
@@ -105,6 +107,8 @@ impl<'a> Spinner<'a> {
             style: &DEFAULT,
             theme: &theme::DEFAULT,
             term: Term::stderr(),
+            #[cfg(feature = "ratatui")]
+            started: std::time::Instant::now(),
             frame: 0,
             height: 0,
         }
@@ -182,6 +186,14 @@ impl<'a> Spinner<'a> {
                 .join()
                 .map_err(|e| io::Error::other(format!("thread panicked: {e:?}")))
         })
+    }
+
+    /// What the spinner looks like now, going by how long ago it was
+    /// created, for when it isn't [`run`](Self::run).
+    #[cfg(feature = "ratatui")]
+    pub(crate) fn view(&self) -> View {
+        let frame = self.started.elapsed().as_millis() / self.style.fps.as_millis().max(1);
+        self.render(frame as usize)
     }
 
     fn render(&self, frame: usize) -> View {

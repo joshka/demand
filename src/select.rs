@@ -359,6 +359,7 @@ impl<'a, T> Select<'a, T> {
             .enumerate()
         {
             if self.cursor_y == i {
+                out.mark_focus();
                 out.set_color(&self.theme.cursor);
                 write!(out, "{}", self.theme.cursor_str);
             } else {

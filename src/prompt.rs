@@ -80,7 +80,7 @@ impl From<crossterm::event::KeyEvent> for KeyPress {
     }
 }
 
-/// What every prompt provides to be hosted.
+/// What every prompt provides to be hosted, by the CLI or by ratatui.
 pub(crate) trait Prompt {
     /// React to a key.
     fn on_key(&mut self, key: Key) -> Outcome;

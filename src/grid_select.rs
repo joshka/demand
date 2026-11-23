@@ -444,6 +444,7 @@ impl<'a, T> GridSelect<'a, T> {
         for (pos, &i) in filtered.iter().enumerate().skip(start).take(self.capacity) {
             let row = &self.rows[i];
             if pos == self.cursor {
+                out.mark_focus();
                 out.set_color(&self.theme.cursor);
                 write!(out, " > ");
             } else {
@@ -500,6 +501,7 @@ impl<'a, T> GridSelect<'a, T> {
             write!(out, "/");
             out.reset();
             write!(out, "{}", self.filter);
+            out.mark_caret();
             out.set_color(&self.theme.real_cursor_color(None));
             write!(out, " ");
             out.reset();

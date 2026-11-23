@@ -43,6 +43,8 @@ mod synchronized_output;
 mod theme;
 mod tty;
 mod view;
+#[cfg(feature = "ratatui")]
+mod widget;
 mod wizard;
 
 #[cfg(test)]

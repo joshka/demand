@@ -261,6 +261,7 @@ impl<'a> Steps<'a> {
                 write!(out, "{}", self.theme.breadcrumb_separator);
             }
             if i == self.current {
+                out.mark_focus();
                 out.set_color(&self.theme.breadcrumb_active);
                 write!(out, "[{}:{label}]", i + 1);
             } else if self.visited[i] {

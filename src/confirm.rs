@@ -222,6 +222,7 @@ impl<'a> Confirm<'a> {
         }
         writeln!(out, "\n");
 
+        out.mark_focus();
         write!(out, " ");
         if self.selected {
             out.set_color(&self.theme.focused_button);

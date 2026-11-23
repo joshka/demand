@@ -197,6 +197,8 @@ pub struct Input<'a> {
     kill_buffer: String,
     /// Whether the first suggestions have been asked for.
     prepared: bool,
+    #[cfg(feature = "ratatui")]
+    pub(crate) cursor_position: Option<ratatui_core::layout::Position>,
 }
 
 const CTRL_B: char = '\u{02}';
@@ -238,6 +240,8 @@ impl<'a> Input<'a> {
             suggestions_scroll_offset: 0,
             kill_buffer: String::new(),
             prepared: false,
+            #[cfg(feature = "ratatui")]
+            cursor_position: None,
         }
     }
 

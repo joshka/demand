@@ -10,6 +10,8 @@ keywords = ["cli", "prompt", "console"]
 include = ["src/**/*", "examples/**/*", "README.md", "CHANGELOG.md", "LICENSE"]
 
 [features]
+# Render prompts as ratatui widgets.
+ratatui = ["dep:ratatui-core"]
 # Pass crossterm key events to prompts.
 crossterm = ["dep:crossterm"]
 
@@ -18,6 +20,7 @@ console = "0.16"
 crossterm = { version = "0.29", optional = true }
 fuzzy-matcher = "0.3"
 itertools = "0.15"
+ratatui-core = { version = "0.1", optional = true }
 signal-hook = "0.4"
 termcolor = "1"
 

@@ -445,6 +445,7 @@ impl<'a, T> MultiSelect<'a, T> {
             .enumerate()
         {
             if self.cursor == i {
+                out.mark_focus();
                 out.set_color(&self.theme.cursor);
                 write!(out, " >");
             } else {
