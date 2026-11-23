@@ -1,11 +1,12 @@
 use std::io;
-use std::io::Write;
 
 use console::{Key, Term};
-use termcolor::{Buffer, WriteColor};
 
+use crate::host::Host;
+use crate::prompt::{CliOptions, Outcome, Prompt};
+use crate::theme;
 use crate::theme::Theme;
-use crate::{ctrlc, theme};
+use crate::view::{Size, View};
 
 #[derive(Clone, Debug, Default, PartialEq)]
 /// A button to select in a dialog
@@ -67,9 +68,7 @@ pub struct Dialog<'a> {
     /// The buttons to display to the user
     pub buttons: Vec<DialogButton>,
 
-    term: Term,
     clear_screen: bool,
-    frame: crate::frame::Frame,
     selected_button_idx: usize,
 }
 
@@ -82,10 +81,8 @@ impl<'a> Dialog<'a> {
             title: title.into(),
             description: String::new(),
             theme: &*theme::DEFAULT,
-            term: Term::stderr(),
             buttons: vec![DialogButton::new("Ok"), DialogButton::new("Cancel")],
             clear_screen: false,
-            frame: Default::default(),
             selected_button_idx: 0,
         }
     }
@@ -139,49 +136,16 @@ impl<'a> Dialog<'a> {
     /// This function will block until the user submits the input. If the user cancels the input,
     /// an error of type `io::ErrorKind::Interrupted` is returned.
     pub fn run(mut self) -> io::Result<String> {
-        let ctrlc_handle = ctrlc::show_cursor_after_ctrlc(&self.term)?;
-
-        self.term.hide_cursor()?;
-        loop {
-            let term = self.term.clone();
-            crate::synchronized_output::run(&term, || self.draw())?;
-            match self.term.read_key()? {
-                Key::ArrowLeft | Key::Char('h') => self.handle_left(),
-                Key::ArrowRight | Key::Char('l') => self.handle_right(),
-                Key::Char(c) if self.buttons.iter().any(|b| b.key == c) => {
-                    self.selected_button_idx =
-                        self.buttons.iter().position(|b| b.key == c).unwrap();
-                    ctrlc_handle.close();
-                    return self.handle_submit();
-                }
-                Key::Enter => {
-                    ctrlc_handle.close();
-                    return self.handle_submit();
-                }
-                Key::Escape => {
-                    self.term.show_cursor()?;
-                    ctrlc_handle.close();
-                    return Err(io::Error::new(io::ErrorKind::Interrupted, "user cancelled"));
-                }
-                _ => {}
-            }
-        }
+        Host::new(Term::stderr()).run(&mut self, |dialog| {
+            Some(dialog.selected_label().unwrap_or_default().to_string())
+        })
     }
 
-    fn handle_submit(mut self) -> io::Result<String> {
-        let term = self.term.clone();
-        crate::synchronized_output::run(&term, || {
-            self.clear()?;
-            self.term.show_cursor()?;
-            let output = self.render_success()?;
-            self.term.write_all(output.as_bytes())
-        })?;
-        let result = if !self.buttons.is_empty() {
-            self.buttons[self.selected_button_idx].label.clone()
-        } else {
-            "".to_string()
-        };
-        Ok(result)
+    /// The label of the selected button, if there are any buttons.
+    fn selected_label(&self) -> Option<&str> {
+        self.buttons
+            .get(self.selected_button_idx)
+            .map(|button| button.label.as_str())
     }
 
     fn handle_left(&mut self) {
@@ -193,31 +157,31 @@ impl<'a> Dialog<'a> {
         self.selected_button_idx = (self.selected_button_idx + 1) % self.buttons.len();
     }
 
-    fn render(&self) -> io::Result<String> {
-        let mut out = Buffer::ansi();
+    fn render(&self) -> View {
+        let mut out = View::default();
 
-        out.set_color(&self.theme.title)?;
-        writeln!(out, "{}", self.title)?;
+        out.set_color(&self.theme.title);
+        writeln!(out, "{}", self.title);
 
         if !self.description.is_empty() {
-            out.set_color(&self.theme.description)?;
-            write!(out, "{}", self.description)?;
+            out.set_color(&self.theme.description);
+            write!(out, "{}", self.description);
         }
 
-        writeln!(out, "\n")?;
+        writeln!(out, "\n");
 
         for (i, button) in self.buttons.iter().enumerate() {
-            write!(out, " ")?;
+            write!(out, " ");
             if self.selected_button_idx == i {
-                out.set_color(&self.theme.focused_button)?;
+                out.set_color(&self.theme.focused_button);
             } else {
-                out.set_color(&self.theme.blurred_button)?;
+                out.set_color(&self.theme.blurred_button);
             }
-            write!(out, "  {}  ", button.label)?;
-            out.reset()?;
+            write!(out, "  {}  ", button.label);
+            out.reset();
         }
 
-        writeln!(out, "\n")?;
+        writeln!(out, "\n");
 
         let mut help_keys = vec![("←/→", "toggle")];
         let button_keys = self
@@ -231,27 +195,18 @@ impl<'a> Dialog<'a> {
             });
         let submit_keys = format!("{button_keys}enter");
         help_keys.push((&submit_keys, "submit"));
-        for (i, (key, desc)) in help_keys.iter().enumerate() {
-            if i > 0 {
-                out.set_color(&self.theme.help_sep)?;
-                write!(out, " • ")?;
-            }
-            out.set_color(&self.theme.help_key)?;
-            write!(out, "{key}")?;
-            out.set_color(&self.theme.help_desc)?;
-            write!(out, " {desc}")?;
-        }
-        writeln!(out)?;
+        out.write_help(self.theme, &help_keys, false);
+        writeln!(out);
 
-        out.reset()?;
-        Ok(std::str::from_utf8(out.as_slice()).unwrap().to_string())
+        out.reset();
+        out
     }
 
-    fn render_success(&self) -> io::Result<String> {
-        let mut out = Buffer::ansi();
-        out.set_color(&self.theme.title)?;
-        write!(out, "{}", self.title)?;
-        out.set_color(&self.theme.selected_option)?;
+    fn render_success(&self) -> View {
+        let mut out = View::default();
+        out.set_color(&self.theme.title);
+        write!(out, "{}", self.title);
+        out.set_color(&self.theme.selected_option);
         writeln!(
             out,
             " {}",
@@ -260,28 +215,45 @@ impl<'a> Dialog<'a> {
             } else {
                 "".to_string()
             }
-        )?;
-        out.reset()?;
-        Ok(std::str::from_utf8(out.as_slice()).unwrap().to_string())
+        );
+        out.reset();
+        out
+    }
+}
+
+impl Prompt for Dialog<'_> {
+    fn on_key(&mut self, key: Key) -> Outcome {
+        match key {
+            Key::ArrowLeft | Key::Char('h') if !self.buttons.is_empty() => self.handle_left(),
+            Key::ArrowRight | Key::Char('l') if !self.buttons.is_empty() => self.handle_right(),
+            Key::Char(c) => {
+                let Some(idx) = self.buttons.iter().position(|b| b.key == c) else {
+                    return Outcome::Ignored;
+                };
+                self.selected_button_idx = idx;
+                return Outcome::Submit;
+            }
+            Key::Enter => return Outcome::Submit,
+            Key::Escape => return Outcome::Cancel,
+            _ => return Outcome::Ignored,
+        }
+        Outcome::Handled
     }
 
-    /// Render a frame and draw it over the previous one. With
-    /// `clear_screen` the screen is wiped first, so there is nothing left
-    /// to draw over and the frame goes out whole.
-    fn draw(&mut self) -> io::Result<()> {
-        if self.clear_screen {
-            self.clear()?;
-        }
-        let output = self.render()?;
-        self.frame.update(&self.term, output)
+    fn view(&mut self, _size: Size) -> View {
+        self.render()
     }
 
-    fn clear(&mut self) -> io::Result<()> {
-        self.frame.clear(&self.term)?;
-        if self.clear_screen {
-            self.term.clear_screen()?;
+    fn success(&mut self) -> View {
+        self.render_success()
+    }
+
+    fn cli(&self) -> CliOptions {
+        CliOptions {
+            clear_screen: self.clear_screen,
+            clear_on_cancel: false,
+            ..Default::default()
         }
-        Ok(())
     }
 }
 
@@ -313,7 +285,7 @@ mod tests {
             ←/→ toggle • o/n/c/enter submit
             "
             },
-            without_ansi(dialog.render().unwrap().as_str())
+            without_ansi(dialog.render().to_ansi().as_str())
         );
     }
     /// Regression for jdx/demand#7: help text or a description wider than
@@ -324,15 +296,15 @@ mod tests {
     fn a_wrapped_description_does_not_stack_copies_of_the_frame() {
         let (term, buf) = capture_term();
         let mut prompt = Dialog::new("Proceed?").description(&"d".repeat(200));
-        prompt.term = term;
-        let width = prompt.term.size().1 as usize;
+        let mut host = Host::new(term);
+        let width = host.term.size().1 as usize;
         assert!(
             width < 200,
             "test needs a description wider than the terminal"
         );
 
         for _ in 0..3 {
-            prompt.draw().unwrap();
+            host.draw(&mut prompt).unwrap();
             prompt.handle_right();
         }
 
